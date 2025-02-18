@@ -1,0 +1,13 @@
+[package]
+name = "vid_uvc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.95"
+eframe = "0.31.0"
+egui = "0.31.0"
+enum-map = { version = "2.7.3", features = ["serde"] }
+eye = { version = "0.5.0", path = "eye-rs/eye" }
+serde = "1.0.217"
+serde_json = "1.0.138"
