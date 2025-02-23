@@ -1,5 +1,6 @@
 #![allow(static_mut_refs)]
 
+use core::f32;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -7,6 +8,7 @@ use std::sync::{Mutex, mpsc};
 use std::{fs, thread};
 
 use eframe::{App, Frame, NativeOptions};
+use egui::epaint::PathStroke;
 use egui::load::SizedTexture;
 use egui::{
     Button, CentralPanel, Color32, ColorImage, DragValue, Grid, Id, Image, Label, LayerId, Margin,
@@ -32,6 +34,8 @@ struct UVCPlayer {
     profiles: BTreeMap<PathBuf, MicroscopeRatio>,
     active_profile: Option<PathBuf>,
     new_profile_name: String,
+
+    show_labels: bool,
 }
 
 #[derive(Default, Clone, Copy, Serialize, Deserialize)]
@@ -68,7 +72,7 @@ impl Magnification {
             Self::X4 => "4x 1mm",
             Self::X10 => "10x 0.7mm",
             Self::X40 => "40x 0.15mm",
-            Self::X100 => "100X 0.1mm",
+            Self::X100 => "100X 0.05mm",
         }
     }
     pub fn default_cal_len(&self) -> f64 {
@@ -76,7 +80,7 @@ impl Magnification {
             Self::X4 => 1e3,
             Self::X10 => 0.7e3,
             Self::X40 => 0.15e3,
-            Self::X100 => 0.1e3,
+            Self::X100 => 0.05e3,
         }
     }
 }
@@ -155,11 +159,12 @@ fn main() -> Result<()> {
 
     // Create a list of valid capture devices in the system.
     let dev_descrs = ctx.devices()?;
+    dbg!(&dev_descrs);
     // Print the supported formats for each device.
     let dev = ctx.open_device(&dev_descrs[0].uri)?;
+    // let dev = ctx.open_device("v4l:///dev/video")?;
     let dev = Device::new(dev)?;
     dbg!(&dev.streams());
-
     let maxxed = dev
         .streams()?
         .into_iter()
@@ -170,7 +175,6 @@ fn main() -> Result<()> {
 
     let stream_descr = maxxed;
     let dimensions = [stream_descr.width as usize, stream_descr.height as usize];
-
     println!("Selected stream:\n{:?}", stream_descr);
 
     let mut stream = dev.start_stream(&stream_descr)?;
@@ -192,6 +196,7 @@ fn main() -> Result<()> {
                 profiles: Default::default(),
                 active_profile: None,
                 new_profile_name: "0.5x".to_owned(),
+                show_labels: true,
             };
 
             app.load_profiles()?;
@@ -201,12 +206,14 @@ fn main() -> Result<()> {
 
             thread::spawn(move || {
                 loop {
-                    let buf = stream.next().unwrap().unwrap();
-                    txt.set(
-                        ColorImage::from_rgb(dimensions, &buf),
-                        TextureOptions::default(),
-                    );
-                    ctx.request_repaint();
+                    let buf = stream.next();
+                    if let Some(Ok(buf)) = buf {
+                        txt.set(
+                            ColorImage::from_rgb(dimensions, &buf),
+                            TextureOptions::default(),
+                        );
+                        ctx.request_repaint();
+                    }
                 }
             });
 
@@ -287,6 +294,7 @@ impl App for UVCPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         egui::SidePanel::new(egui::panel::Side::Right, "rpanel").show(ctx, |ui| {
             ui.add_space(10.);
+
             for (pb, data) in &self.profiles {
                 let lb = ui.selectable_label(
                     self.active_profile.as_ref().map_or(false, |v| v == pb),
@@ -307,16 +315,31 @@ impl App for UVCPlayer {
             });
 
             self.ratio.ui(ui);
+
+            ui.add_space(20.);
+            ui.add(Label::new("press ESC to clear boxes. \npress Z to hide labels"));
+
         });
         CentralPanel::default().show(ctx, |ui| {
             let response = ui.add(Image::new(SizedTexture::from_handle(&self.texture)));
             let pt = ui.painter();
             let sense = response.interact(Sense::all());
+
+            ui.input(|k| {
+                if k.key_pressed(egui::Key::Escape) {
+                    self.rects.clear();
+                }
+                if k.key_pressed(egui::Key::Z) {
+                    self.show_labels = !self.show_labels;
+                }
+            });
+
             if sense.drag_started() {
                 if let Some(p) = sense.interact_pointer_pos() {
                     self.rect_begin = Some(p);
                 }
             }
+
             if sense.dragged() {
                 let _ = sense.drag_motion();
                 if let Some(p) = sense.interact_pointer_pos() {
@@ -335,71 +358,92 @@ impl App for UVCPlayer {
                             .result
                             .calibrate(self.ratio.active.unwrap(), len as f64);
                     }
+
+                    if sense.drag_stopped() {
+                        self.rects.push(moving_rect);
+                        self.rect_begin = None;
+                        self.rect_motion = None;
+                    }
                 }
             }
             if sense.drag_stopped() {
                 self.ratio.calibrating = false;
                 self.sync_to_profile();
                 let rex = self.dump_profile();
-                dbg!(&rex);
+                if rex.is_err() {
+                    dbg!(&rex);
+                }
             }
 
-            let all_rects = self.rects.iter().chain(&appeneded);
+            let all_rects = self.rects.iter();
             for rect in all_rects.clone() {
-                let inside_width = 5.;
+                let inside_width = 3.;
                 pt.add(epaint::RectShape::new(
                     *rect,
                     0,
                     Color32::TRANSPARENT,
-                    Stroke::new(inside_width, Color32::BLACK.gamma_multiply(0.5)),
+                    Stroke::new(inside_width, Color32::WHITE.gamma_multiply(0.5)),
                     egui::StrokeKind::Outside,
                 ));
-                let out_rect = rect.expand(inside_width);
-                pt.add(epaint::RectShape::new(
-                    out_rect,
-                    0,
-                    Color32::TRANSPARENT,
-                    Stroke::new(5., Color32::WHITE.gamma_multiply(0.5)),
-                    egui::StrokeKind::Outside,
-                ));
+                // let out_rect = rect.expand(inside_width);
+                // pt.add(epaint::RectShape::new(
+                //     out_rect,
+                //     0,
+                //     Color32::TRANSPARENT,
+                //     Stroke::new(2., Color32::WHITE.gamma_multiply(0.5)),
+                //     egui::StrokeKind::Outside,
+                // ));
             }
 
             let dist_label = |px: f32| {
                 if let Some(a) = self.ratio.active {
                     let n = self.ratio.from_px(px as f64);
-                    format!(" {:.2}µm ", n)
+                    format!("{:.2}µm", n)
                 } else {
-                    format!(" {}px ", px.round())
+                    format!("{}px", px.round())
                 }
             };
 
             for rect in all_rects {
-                let rect_lb_x = Rect::EVERYTHING
-                    .with_min_x(rect.left() - 100.)
-                    .with_max_x(rect.right() + 100.)
-                    .with_min_y(rect.top() - 60.)
-                    .with_max_y(rect.top() - 8.);
-                let wd = dist_label(rect.width());
-                let lb = RichText::new(wd)
-                    .color(Color32::WHITE)
-                    .size(40.)
-                    .background_color(Color32::BLACK.gamma_multiply(0.5));
-                let lb = Label::new(lb);
-                let rect_lb_y = Rect::EVERYTHING
-                    .with_min_x(rect.right() - 60.)
-                    .with_min_y(rect.top())
-                    .with_max_y(rect.bottom())
-                    .with_max_x(rect.right() + 200.);
+                if self.show_labels {
+                    let rect_lb_x = Rect::EVERYTHING
+                        .with_min_x(rect.left() - 100.)
+                        .with_max_x(rect.right() + 100.)
+                        .with_min_y(rect.top() - 60.)
+                        .with_max_y(rect.top() - 8.);
+                    let wd = dist_label(rect.width());
+                    let lb = RichText::new(wd)
+                        .color(Color32::WHITE)
+                        .size(40.)
+                        .background_color(Color32::BLACK.gamma_multiply(0.2));
+                    let lb = Label::new(lb);
+                    let rect_lb_y = Rect::EVERYTHING
+                        .with_min_x(rect.right() - 60.)
+                        .with_min_y(rect.top())
+                        .with_max_y(rect.bottom())
+                        .with_max_x(rect.right() + 200.);
 
-                ui.put(rect_lb_x, lb);
-                let ht = dist_label(rect.height());
-                let lb = RichText::new(ht)
-                    .color(Color32::WHITE)
-                    .size(40.)
-                    .background_color(Color32::BLACK.gamma_multiply(0.5));
-                let lb = Label::new(lb);
+                    ui.put(rect_lb_x, lb);
+                    let ht = dist_label(rect.height());
+                    let lb = RichText::new(ht)
+                        .color(Color32::WHITE)
+                        .size(40.)
+                        .background_color(Color32::BLACK.gamma_multiply(0.2));
+                    let lb = Label::new(lb);
 
-                ui.put(rect_lb_y, lb);
+                    ui.put(rect_lb_y, lb);
+                }
+            }
+
+            if let Some(pos) = ctx.pointer_latest_pos() {
+                ui.painter().add(epaint::PathShape::line(
+                    vec![pos2(pos.x, 0.), pos2(pos.x, ctx.screen_rect().height())],
+                    PathStroke::new(3., Color32::WHITE),
+                ));
+                ui.painter().add(epaint::PathShape::line(
+                    vec![pos2(0., pos.y), pos2(ctx.screen_rect().width(), pos.y)],
+                    PathStroke::new(3., Color32::WHITE),
+                ));
             }
 
             response
