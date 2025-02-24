@@ -23,7 +23,9 @@ use eye::hal::traits::{Context as _, Device as _, Stream as _};
 use eye::hal::{Error, ErrorKind, PlatformContext};
 
 use anyhow::{Result, bail};
+use inotify::{Inotify, WatchMask};
 use serde::{Deserialize, Serialize};
+
 struct UVCPlayer {
     texture: TextureHandle,
     rects: Vec<Rect>,
@@ -150,16 +152,25 @@ impl Widget for &mut Calibration {
     }
 }
 
-fn main() -> Result<()> {
+struct StreamD<'a> {
+    st: eye::hal::platform::Stream<'a>,
+    d: [usize; 2],
+}
+
+fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
     let ctx = if let Some(ctx) = PlatformContext::all().next() {
         ctx
     } else {
-        return Ok(());
+        return Ok(None);
     };
 
     // Create a list of valid capture devices in the system.
     let dev_descrs = ctx.devices()?;
     dbg!(&dev_descrs);
+
+    if dev_descrs.len() == 0 {
+        return Ok(None);
+    }
     // Print the supported formats for each device.
     let dev = ctx.open_device(&dev_descrs[0].uri)?;
     // let dev = ctx.open_device("v4l:///dev/video")?;
@@ -177,7 +188,34 @@ fn main() -> Result<()> {
     let dimensions = [stream_descr.width as usize, stream_descr.height as usize];
     println!("Selected stream:\n{:?}", stream_descr);
 
-    let mut stream = dev.start_stream(&stream_descr)?;
+    let stream = dev.start_stream(&stream_descr)?;
+
+    Ok(Some(StreamD {
+        st: stream,
+        d: dimensions,
+    }))
+}
+
+fn main() -> Result<()> {
+    let (sx, rx) = mpsc::channel::<StreamD>();
+
+    thread::spawn(move || {
+        let mut ino = Inotify::init()?;
+        ino.watches()
+            .add("/dev/", WatchMask::CREATE | WatchMask::MODIFY)?;
+        print!("watching /dev/");
+        let mut buffer = [0u8; 4096];
+
+        loop {
+            let ev = ino.read_events_blocking(&mut buffer)?;
+            println!("/dev/ changed");
+            if let Ok(Some(s)) = find_stream() {
+                let _ = sx.send(s);
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    });
 
     let _ = eframe::run_native(
         "app",
@@ -206,13 +244,20 @@ fn main() -> Result<()> {
 
             thread::spawn(move || {
                 loop {
-                    let buf = stream.next();
-                    if let Some(Ok(buf)) = buf {
-                        txt.set(
-                            ColorImage::from_rgb(dimensions, &buf),
-                            TextureOptions::default(),
-                        );
-                        ctx.request_repaint();
+                    if let Ok(mut stream) = rx.recv() {
+                        loop {
+                            let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
+                            if let Some(Ok(buf)) = buf {
+                                txt.set(
+                                    ColorImage::from_rgb(stream.d, &buf),
+                                    TextureOptions::default(),
+                                );
+                                ctx.request_repaint();
+                            } else {
+                                println!("stream ended");
+                                break;
+                            }
+                        }
                     }
                 }
             });
@@ -317,8 +362,9 @@ impl App for UVCPlayer {
             self.ratio.ui(ui);
 
             ui.add_space(20.);
-            ui.add(Label::new("press ESC to clear boxes. \npress Z to hide labels"));
-
+            ui.add(Label::new(
+                "press ESC to clear boxes. \npress Z to hide labels",
+            ));
         });
         CentralPanel::default().show(ctx, |ui| {
             let response = ui.add(Image::new(SizedTexture::from_handle(&self.texture)));
