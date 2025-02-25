@@ -4,7 +4,7 @@ use core::f32;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::{fs, thread};
 
 use eframe::{App, Frame, NativeOptions};
@@ -38,6 +38,8 @@ struct UVCPlayer {
     new_profile_name: String,
 
     show_labels: bool,
+
+    waiting: Arc<Mutex<bool>>,
 }
 
 #[derive(Default, Clone, Copy, Serialize, Deserialize)]
@@ -235,16 +237,21 @@ fn main() -> Result<()> {
                 active_profile: None,
                 new_profile_name: "0.5x".to_owned(),
                 show_labels: true,
+                waiting: Arc::new(Mutex::new(true)),
             };
 
             app.load_profiles()?;
 
             let mut txt = app.texture.clone();
             let ctx = ctx.egui_ctx.clone();
+            let waiting = app.waiting.clone();
 
             thread::spawn(move || {
                 loop {
                     if let Ok(mut stream) = rx.recv() {
+                        let mut k = waiting.lock().unwrap();
+                        *k = false;
+                        drop(k);
                         loop {
                             let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
                             if let Some(Ok(buf)) = buf {
@@ -258,6 +265,9 @@ fn main() -> Result<()> {
                                 break;
                             }
                         }
+                        let mut k = waiting.lock().unwrap();
+                        *k = true;
+                        drop(k);
                     }
                 }
             });
@@ -367,132 +377,137 @@ impl App for UVCPlayer {
             ));
         });
         CentralPanel::default().show(ctx, |ui| {
-            let response = ui.add(Image::new(SizedTexture::from_handle(&self.texture)));
-            let pt = ui.painter();
-            let sense = response.interact(Sense::all());
+            if self.waiting.try_lock().map_or(true, |x| *x) {
+                ui.centered_and_justified(|ui| ui.label("waiting for device"))
+                    .response
+            } else {
+                let response = ui.add(Image::new(SizedTexture::from_handle(&self.texture)));
 
-            ui.input(|k| {
-                if k.key_pressed(egui::Key::Escape) {
-                    self.rects.clear();
-                }
-                if k.key_pressed(egui::Key::Z) {
-                    self.show_labels = !self.show_labels;
-                }
-            });
+                let pt = ui.painter();
+                let sense = response.interact(Sense::all());
 
-            if sense.drag_started() {
-                if let Some(p) = sense.interact_pointer_pos() {
-                    self.rect_begin = Some(p);
-                }
-            }
-
-            if sense.dragged() {
-                let _ = sense.drag_motion();
-                if let Some(p) = sense.interact_pointer_pos() {
-                    self.rect_motion = Some(p);
-                }
-            }
-            let mut appeneded = Vec::new();
-            if let Some(bg) = self.rect_begin {
-                if let Some(mv) = self.rect_motion {
-                    let moving_rect = Rect::from_points(&[bg, mv]);
-                    appeneded = vec![moving_rect];
-
-                    if self.ratio.calibrating {
-                        let len = moving_rect.width();
-                        self.ratio
-                            .result
-                            .calibrate(self.ratio.active.unwrap(), len as f64);
+                ui.input(|k| {
+                    if k.key_pressed(egui::Key::Escape) {
+                        self.rects.clear();
                     }
+                    if k.key_pressed(egui::Key::Z) {
+                        self.show_labels = !self.show_labels;
+                    }
+                });
 
-                    if sense.drag_stopped() {
-                        self.rects.push(moving_rect);
-                        self.rect_begin = None;
-                        self.rect_motion = None;
+                if sense.drag_started() {
+                    if let Some(p) = sense.interact_pointer_pos() {
+                        self.rect_begin = Some(p);
                     }
                 }
-            }
-            if sense.drag_stopped() {
-                self.ratio.calibrating = false;
-                self.sync_to_profile();
-                let rex = self.dump_profile();
-                if rex.is_err() {
-                    dbg!(&rex);
+
+                if sense.dragged() {
+                    let _ = sense.drag_motion();
+                    if let Some(p) = sense.interact_pointer_pos() {
+                        self.rect_motion = Some(p);
+                    }
                 }
-            }
+                let mut appeneded = Vec::new();
+                if let Some(bg) = self.rect_begin {
+                    if let Some(mv) = self.rect_motion {
+                        let moving_rect = Rect::from_points(&[bg, mv]);
+                        appeneded = vec![moving_rect];
 
-            let all_rects = self.rects.iter();
-            for rect in all_rects.clone() {
-                let inside_width = 3.;
-                pt.add(epaint::RectShape::new(
-                    *rect,
-                    0,
-                    Color32::TRANSPARENT,
-                    Stroke::new(inside_width, Color32::WHITE.gamma_multiply(0.5)),
-                    egui::StrokeKind::Outside,
-                ));
-                // let out_rect = rect.expand(inside_width);
-                // pt.add(epaint::RectShape::new(
-                //     out_rect,
-                //     0,
-                //     Color32::TRANSPARENT,
-                //     Stroke::new(2., Color32::WHITE.gamma_multiply(0.5)),
-                //     egui::StrokeKind::Outside,
-                // ));
-            }
+                        if self.ratio.calibrating {
+                            let len = moving_rect.width();
+                            self.ratio
+                                .result
+                                .calibrate(self.ratio.active.unwrap(), len as f64);
+                        }
 
-            let dist_label = |px: f32| {
-                if let Some(a) = self.ratio.active {
-                    let n = self.ratio.from_px(px as f64);
-                    format!("{:.2}µm", n)
-                } else {
-                    format!("{}px", px.round())
+                        if sense.drag_stopped() {
+                            self.rects.push(moving_rect);
+                            self.rect_begin = None;
+                            self.rect_motion = None;
+                        }
+                    }
                 }
-            };
-
-            for rect in all_rects {
-                if self.show_labels {
-                    let rect_lb_x = Rect::EVERYTHING
-                        .with_min_x(rect.left() - 100.)
-                        .with_max_x(rect.right() + 100.)
-                        .with_min_y(rect.top() - 60.)
-                        .with_max_y(rect.top() - 8.);
-                    let wd = dist_label(rect.width());
-                    let lb = RichText::new(wd)
-                        .color(Color32::WHITE)
-                        .size(40.)
-                        .background_color(Color32::BLACK.gamma_multiply(0.2));
-                    let lb = Label::new(lb);
-                    let rect_lb_y = Rect::EVERYTHING
-                        .with_min_x(rect.right() - 60.)
-                        .with_min_y(rect.top())
-                        .with_max_y(rect.bottom())
-                        .with_max_x(rect.right() + 200.);
-
-                    ui.put(rect_lb_x, lb);
-                    let ht = dist_label(rect.height());
-                    let lb = RichText::new(ht)
-                        .color(Color32::WHITE)
-                        .size(40.)
-                        .background_color(Color32::BLACK.gamma_multiply(0.2));
-                    let lb = Label::new(lb);
-
-                    ui.put(rect_lb_y, lb);
+                if sense.drag_stopped() {
+                    self.ratio.calibrating = false;
+                    self.sync_to_profile();
+                    let rex = self.dump_profile();
+                    if rex.is_err() {
+                        dbg!(&rex);
+                    }
                 }
-            }
 
-            if let Some(pos) = ctx.pointer_latest_pos() {
-                ui.painter().add(epaint::PathShape::line(
-                    vec![pos2(pos.x, 0.), pos2(pos.x, ctx.screen_rect().height())],
-                    PathStroke::new(3., Color32::WHITE),
-                ));
-                ui.painter().add(epaint::PathShape::line(
-                    vec![pos2(0., pos.y), pos2(ctx.screen_rect().width(), pos.y)],
-                    PathStroke::new(3., Color32::WHITE),
-                ));
-            }
+                let all_rects = self.rects.iter();
+                for rect in all_rects.clone() {
+                    let inside_width = 3.;
+                    pt.add(epaint::RectShape::new(
+                        *rect,
+                        0,
+                        Color32::TRANSPARENT,
+                        Stroke::new(inside_width, Color32::WHITE.gamma_multiply(0.5)),
+                        egui::StrokeKind::Outside,
+                    ));
+                    // let out_rect = rect.expand(inside_width);
+                    // pt.add(epaint::RectShape::new(
+                    //     out_rect,
+                    //     0,
+                    //     Color32::TRANSPARENT,
+                    //     Stroke::new(2., Color32::WHITE.gamma_multiply(0.5)),
+                    //     egui::StrokeKind::Outside,
+                    // ));
+                }
 
-            response
+                let dist_label = |px: f32| {
+                    if let Some(a) = self.ratio.active {
+                        let n = self.ratio.from_px(px as f64);
+                        format!("{:.2}µm", n)
+                    } else {
+                        format!("{}px", px.round())
+                    }
+                };
+
+                for rect in all_rects {
+                    if self.show_labels {
+                        let rect_lb_x = Rect::EVERYTHING
+                            .with_min_x(rect.left() - 100.)
+                            .with_max_x(rect.right() + 100.)
+                            .with_min_y(rect.top() - 60.)
+                            .with_max_y(rect.top() - 8.);
+                        let wd = dist_label(rect.width());
+                        let lb = RichText::new(wd)
+                            .color(Color32::WHITE)
+                            .size(40.)
+                            .background_color(Color32::BLACK.gamma_multiply(0.2));
+                        let lb = Label::new(lb);
+                        let rect_lb_y = Rect::EVERYTHING
+                            .with_min_x(rect.right() - 60.)
+                            .with_min_y(rect.top())
+                            .with_max_y(rect.bottom())
+                            .with_max_x(rect.right() + 200.);
+
+                        ui.put(rect_lb_x, lb);
+                        let ht = dist_label(rect.height());
+                        let lb = RichText::new(ht)
+                            .color(Color32::WHITE)
+                            .size(40.)
+                            .background_color(Color32::BLACK.gamma_multiply(0.2));
+                        let lb = Label::new(lb);
+
+                        ui.put(rect_lb_y, lb);
+                    }
+                }
+
+                if let Some(pos) = ctx.pointer_latest_pos() {
+                    ui.painter().add(epaint::PathShape::line(
+                        vec![pos2(pos.x, 0.), pos2(pos.x, ctx.screen_rect().height())],
+                        PathStroke::new(3., Color32::WHITE),
+                    ));
+                    ui.painter().add(epaint::PathShape::line(
+                        vec![pos2(0., pos.y), pos2(ctx.screen_rect().width(), pos.y)],
+                        PathStroke::new(3., Color32::WHITE),
+                    ));
+                }
+                response
+            }
         });
     }
 }
