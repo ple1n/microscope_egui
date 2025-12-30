@@ -164,7 +164,7 @@ impl Widget for &mut Calibration {
                 }
 
                 ui.add(Label::new(RichText::new(format!(
-                    "{} µm/px",
+                    "{:.2} µm/px",
                     self.result.map[self.active.unwrap()]
                 ))));
             }
