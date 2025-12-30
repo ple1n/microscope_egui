@@ -381,7 +381,11 @@ impl App for UVCPlayer {
                 ui.centered_and_justified(|ui| ui.label("waiting for device"))
                     .response
             } else {
-                let response = ui.add(Image::new(SizedTexture::from_handle(&self.texture)));
+                let response = ui.add(
+                    Image::new(SizedTexture::from_handle(&self.texture))
+                        .maintain_aspect_ratio(true)
+                        .shrink_to_fit(),
+                );
 
                 let pt = ui.painter();
                 let sense = response.interact(Sense::all());
