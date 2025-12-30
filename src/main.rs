@@ -40,6 +40,23 @@ struct UVCPlayer {
     show_labels: bool,
 
     waiting: Arc<Mutex<bool>>,
+
+    // Camera selection
+    available_cameras: Arc<Mutex<Vec<CameraInfo>>>,
+    selected_camera_uri: Arc<Mutex<Option<String>>>,
+    camera_cmd_tx: mpsc::Sender<CameraCommand>,
+}
+
+#[derive(Clone, Debug)]
+struct CameraInfo {
+    uri: String,
+    name: String,
+}
+
+#[derive(Debug)]
+enum CameraCommand {
+    Refresh,
+    Select(String),
 }
 
 #[derive(Default, Clone, Copy, Serialize, Deserialize)]
@@ -159,6 +176,53 @@ struct StreamD<'a> {
     d: [usize; 2],
 }
 
+fn list_cameras() -> Vec<CameraInfo> {
+    let mut cameras = Vec::new();
+    if let Some(ctx) = PlatformContext::all().next() {
+        if let Ok(dev_descrs) = ctx.devices() {
+            for dev in dev_descrs {
+                cameras.push(CameraInfo {
+                    uri: dev.uri.clone(),
+                    name: dev.uri.clone(), // Use URI as name, could parse for friendlier name
+                });
+            }
+        }
+    }
+    cameras
+}
+
+fn find_stream_for_camera<'a>(uri: &str) -> anyhow::Result<Option<StreamD<'a>>> {
+    let ctx = if let Some(ctx) = PlatformContext::all().next() {
+        ctx
+    } else {
+        return Ok(None);
+    };
+
+    let dev = ctx.open_device(uri)?;
+    let dev = Device::new(dev)?;
+    dbg!(&dev.streams());
+    let maxxed = dev
+        .streams()?
+        .into_iter()
+        .filter(|x| x.pixfmt == PixelFormat::Rgb(24))
+        .filter(|x| x.width <= 2560)
+        .max_by_key(|d| d.width as u128 * d.height as u128 / d.interval.as_millis());
+
+    let stream_descr = match maxxed {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let dimensions = [stream_descr.width as usize, stream_descr.height as usize];
+    println!("Selected stream:\n{:?}", stream_descr);
+
+    let stream = dev.start_stream(&stream_descr)?;
+
+    Ok(Some(StreamD {
+        st: stream,
+        d: dimensions,
+    }))
+}
+
 fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
     let ctx = if let Some(ctx) = PlatformContext::all().next() {
         ctx
@@ -199,24 +263,98 @@ fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
 }
 
 fn main() -> Result<()> {
-    let (sx, rx) = mpsc::channel::<StreamD>();
+    let (frame_tx, frame_rx) = mpsc::channel::<(Vec<u8>, [usize; 2])>();
+    let (camera_cmd_tx, camera_cmd_rx) = mpsc::channel::<CameraCommand>();
+    
+    // Shared state for camera list (updated by camera thread)
+    let available_cameras: Arc<Mutex<Vec<CameraInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let selected_camera_uri: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    
+    let cameras_for_thread = available_cameras.clone();
+    let selected_for_thread = selected_camera_uri.clone();
 
+    // Single thread that owns the stream and handles ALL camera operations
     thread::spawn(move || {
-        let mut ino = Inotify::init()?;
-        ino.watches()
-            .add("/dev/", WatchMask::CREATE | WatchMask::MODIFY)?;
-        print!("watching /dev/");
-        let mut buffer = [0u8; 4096];
-
+        let mut current_stream: Option<StreamD> = None;
+        
+        // Initial camera list
+        let initial_cameras = list_cameras();
+        if let Ok(mut cams) = cameras_for_thread.lock() {
+            *cams = initial_cameras;
+        }
+        
+        // Try to open first available camera on startup
+        if let Ok(Some(s)) = find_stream() {
+            current_stream = Some(s);
+        }
+        
         loop {
-            let ev = ino.read_events_blocking(&mut buffer)?;
-            println!("/dev/ changed");
-            if let Ok(Some(s)) = find_stream() {
-                let _ = sx.send(s);
+            // Check for commands (non-blocking)
+            while let Ok(cmd) = camera_cmd_rx.try_recv() {
+                match cmd {
+                    CameraCommand::Refresh => {
+                        println!("Refreshing camera list...");
+                        // Must drop stream before enumerating devices
+                        let had_stream = current_stream.is_some();
+                        let old_uri = selected_for_thread.lock().ok().and_then(|s| s.clone());
+                        current_stream = None;
+                        
+                        let cameras = list_cameras();
+                        if let Ok(mut cams) = cameras_for_thread.lock() {
+                            *cams = cameras;
+                        }
+                        
+                        // Re-open previous camera if it still exists
+                        if had_stream {
+                            if let Some(uri) = old_uri {
+                                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                                    current_stream = Some(s);
+                                }
+                            }
+                        }
+                    }
+                    CameraCommand::Select(uri) => {
+                        println!("Switching to camera: {}", uri);
+                        // Drop old stream first
+                        current_stream = None;
+                        
+                        // Update selected URI
+                        if let Ok(mut sel) = selected_for_thread.lock() {
+                            *sel = Some(uri.clone());
+                        }
+                        
+                        // Open new stream
+                        match find_stream_for_camera(&uri) {
+                            Ok(Some(s)) => {
+                                current_stream = Some(s);
+                                println!("Successfully opened camera");
+                            }
+                            Ok(None) => {
+                                println!("No compatible stream found for camera");
+                            }
+                            Err(e) => {
+                                println!("Error opening camera: {:?}", e);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Read frame from current stream
+            if let Some(ref mut stream) = current_stream {
+                let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
+                if let Some(Ok(buf)) = buf {
+                    // Send frame data to render thread
+                    let _ = frame_tx.send((buf.to_vec(), stream.d));
+                } else {
+                    println!("stream ended");
+                    current_stream = None;
+                }
+            } else {
+                // No stream, sleep a bit to avoid busy loop
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
-
-        Ok::<(), anyhow::Error>(())
     });
 
     let _ = eframe::run_native(
@@ -238,6 +376,9 @@ fn main() -> Result<()> {
                 new_profile_name: "0.5x".to_owned(),
                 show_labels: true,
                 waiting: Arc::new(Mutex::new(true)),
+                available_cameras,
+                selected_camera_uri,
+                camera_cmd_tx,
             };
 
             app.load_profiles()?;
@@ -248,26 +389,23 @@ fn main() -> Result<()> {
 
             thread::spawn(move || {
                 loop {
-                    if let Ok(mut stream) = rx.recv() {
+                    // Receive frames from the camera thread
+                    if let Ok((buf, dimensions)) = frame_rx.recv() {
                         let mut k = waiting.lock().unwrap();
                         *k = false;
                         drop(k);
-                        loop {
-                            let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
-                            if let Some(Ok(buf)) = buf {
-                                txt.set(
-                                    ColorImage::from_rgb(stream.d, &buf),
-                                    TextureOptions::default(),
-                                );
-                                ctx.request_repaint();
-                            } else {
-                                println!("stream ended");
-                                break;
-                            }
-                        }
+                        
+                        txt.set(
+                            ColorImage::from_rgb(dimensions, &buf),
+                            TextureOptions::default(),
+                        );
+                        ctx.request_repaint();
+                    } else {
+                        // Channel closed or error
                         let mut k = waiting.lock().unwrap();
                         *k = true;
                         drop(k);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                     }
                 }
             });
@@ -349,6 +487,54 @@ impl App for UVCPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         egui::SidePanel::new(egui::panel::Side::Right, "rpanel").show(ctx, |ui| {
             ui.add_space(10.);
+
+            // Camera selection UI
+            ui.add(Label::new(
+                RichText::new("Cameras").color(Color32::WHITE.gamma_multiply(0.9)),
+            ));
+            ui.add_space(5.);
+
+            if ui.button("⟳ Refresh").clicked() {
+                let _ = self.camera_cmd_tx.send(CameraCommand::Refresh);
+            }
+            ui.add_space(5.);
+
+            // Clone data to avoid holding locks during UI rendering
+            let cameras: Vec<CameraInfo> = self.available_cameras.lock()
+                .map(|c| c.clone())
+                .unwrap_or_default();
+            let selected_uri: Option<String> = self.selected_camera_uri.lock()
+                .ok()
+                .and_then(|s| s.clone());
+
+            if cameras.is_empty() {
+                ui.label("No cameras found");
+            } else {
+                let mut camera_to_select: Option<String> = None;
+                for cam in cameras.iter() {
+                    let is_selected = selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
+                    
+                    // Extract device name from URI for display
+                    let display_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
+                    
+                    if ui.selectable_label(is_selected, display_name).clicked() {
+                        camera_to_select = Some(cam.uri.clone());
+                    }
+                }
+                
+                if let Some(uri) = camera_to_select {
+                    let _ = self.camera_cmd_tx.send(CameraCommand::Select(uri));
+                }
+            }
+
+            ui.add_space(15.);
+            ui.separator();
+            ui.add_space(10.);
+
+            ui.add(Label::new(
+                RichText::new("Profiles").color(Color32::WHITE.gamma_multiply(0.9)),
+            ));
+            ui.add_space(5.);
 
             for (pb, data) in &self.profiles {
                 let lb = ui.selectable_label(
