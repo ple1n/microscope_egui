@@ -50,7 +50,10 @@ struct UVCPlayer {
 #[derive(Clone, Debug)]
 struct CameraInfo {
     uri: String,
-    name: String,
+    product: String,
+    // Best RGB stream info
+    resolution: Option<(u32, u32)>,
+    fps: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -181,9 +184,36 @@ fn list_cameras() -> Vec<CameraInfo> {
     if let Some(ctx) = PlatformContext::all().next() {
         if let Ok(dev_descrs) = ctx.devices() {
             for dev in dev_descrs {
+                // Try to get best RGB stream info
+                let (resolution, fps) = if let Ok(device) = ctx.open_device(&dev.uri) {
+                    if let Ok(device) = Device::new(device) {
+                        if let Ok(streams) = device.streams() {
+                            let best = streams
+                                .into_iter()
+                                .filter(|x| x.pixfmt == PixelFormat::Rgb(24))
+                                .filter(|x| x.width <= 2560)
+                                .max_by_key(|d| d.width as u128 * d.height as u128 / d.interval.as_millis());
+                            if let Some(s) = best {
+                                let fps = (1000.0 / s.interval.as_millis() as f32).round() as u32;
+                                (Some((s.width, s.height)), Some(fps))
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+                
                 cameras.push(CameraInfo {
                     uri: dev.uri.clone(),
-                    name: dev.uri.clone(), // Use URI as name, could parse for friendlier name
+                    product: dev.product.clone(),
+                    resolution,
+                    fps,
                 });
             }
         }
@@ -284,8 +314,17 @@ fn main() -> Result<()> {
         }
         
         // Try to open first available camera on startup
-        if let Ok(Some(s)) = find_stream() {
-            current_stream = Some(s);
+        if let Ok(cams) = cameras_for_thread.lock() {
+            if let Some(first_cam) = cams.first() {
+                let uri = first_cam.uri.clone();
+                drop(cams); // Release lock before blocking operation
+                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                    current_stream = Some(s);
+                    if let Ok(mut sel) = selected_for_thread.lock() {
+                        *sel = Some(uri);
+                    }
+                }
+            }
         }
         
         loop {
@@ -314,9 +353,23 @@ fn main() -> Result<()> {
                         }
                     }
                     CameraCommand::Select(uri) => {
+                        // Check if already selected
+                        let already_selected = selected_for_thread.lock()
+                            .ok()
+                            .and_then(|s| s.clone())
+                            .map_or(false, |current| current == uri);
+                        
+                        if already_selected {
+                            println!("Camera {} already selected, skipping", uri);
+                            continue;
+                        }
+                        
                         println!("Switching to camera: {}", uri);
                         // Drop old stream first
                         current_stream = None;
+                        
+                        // Small delay to let V4L2 fully release the device
+                        std::thread::sleep(std::time::Duration::from_millis(100));
                         
                         // Update selected URI
                         if let Ok(mut sel) = selected_for_thread.lock() {
@@ -514,12 +567,45 @@ impl App for UVCPlayer {
                 for cam in cameras.iter() {
                     let is_selected = selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
                     
-                    // Extract device name from URI for display
-                    let display_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
+                    // Device name from URI (e.g., video0)
+                    let dev_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
                     
-                    if ui.selectable_label(is_selected, display_name).clicked() {
+                    // Build info string
+                    let info = if let (Some((w, h)), Some(fps)) = (cam.resolution, cam.fps) {
+                        format!("{}x{} {}fps", w, h, fps)
+                    } else {
+                        "no RGB stream".to_string()
+                    };
+                    
+                    let fill = if is_selected {
+                        Color32::from_rgb(60, 80, 60)
+                    } else {
+                        Color32::from_rgb(40, 40, 45)
+                    };
+                    
+                    let frame_resp = egui::Frame::new()
+                        .fill(fill)
+                        .stroke(Stroke::new(1.0, Color32::GRAY))
+                        .corner_radius(4.0)
+                        .inner_margin(6.0)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(dev_name).strong().color(Color32::WHITE));
+                                ui.label(RichText::new(&cam.product).small().color(Color32::LIGHT_GRAY));
+                                ui.label(RichText::new(&info).small().color(Color32::from_rgb(150, 200, 150)));
+                            });
+                        });
+                    
+                    let click_resp = ui.interact(frame_resp.response.rect, egui::Id::new(&cam.uri), Sense::click());
+                    if click_resp.clicked() {
                         camera_to_select = Some(cam.uri.clone());
                     }
+                    if click_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    
+                    ui.add_space(4.0);
                 }
                 
                 if let Some(uri) = camera_to_select {
