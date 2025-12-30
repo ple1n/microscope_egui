@@ -364,7 +364,7 @@ fn main() -> Result<()> {
             let mut app = UVCPlayer {
                 texture: ctx.egui_ctx.load_texture(
                     "vid",
-                    ColorImage::example(),
+                    ColorImage::new([1, 1], Color32::BLACK),
                     Default::default(),
                 ),
                 rect_begin: None,
