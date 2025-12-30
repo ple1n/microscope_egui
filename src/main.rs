@@ -296,59 +296,56 @@ fn main() -> Result<()> {
     let (frame_tx, frame_rx) = mpsc::channel::<(Vec<u8>, [usize; 2])>();
     let (camera_cmd_tx, camera_cmd_rx) = mpsc::channel::<CameraCommand>();
     
-    // Shared state for camera list (updated by camera thread)
+    // Shared state for camera list
     let available_cameras: Arc<Mutex<Vec<CameraInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let selected_camera_uri: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     
     let cameras_for_thread = available_cameras.clone();
     let selected_for_thread = selected_camera_uri.clone();
 
-    // Single thread that owns the stream and handles ALL camera operations
+    // Single camera thread - owns the stream directly
+    // Blocking on frame read is OK: at 30fps, commands process every ~33ms
     thread::spawn(move || {
         let mut current_stream: Option<StreamD> = None;
         
-        // Initial camera list
+        // Initial camera list (no stream open yet, safe to enumerate)
         let initial_cameras = list_cameras();
+        let first_uri = initial_cameras.first().map(|c| c.uri.clone());
         if let Ok(mut cams) = cameras_for_thread.lock() {
             *cams = initial_cameras;
         }
         
-        // Try to open first available camera on startup
-        if let Ok(cams) = cameras_for_thread.lock() {
-            if let Some(first_cam) = cams.first() {
-                let uri = first_cam.uri.clone();
-                drop(cams); // Release lock before blocking operation
-                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                    current_stream = Some(s);
-                    if let Ok(mut sel) = selected_for_thread.lock() {
-                        *sel = Some(uri);
-                    }
+        // Open first camera
+        if let Some(uri) = first_uri {
+            if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                current_stream = Some(s);
+                if let Ok(mut sel) = selected_for_thread.lock() {
+                    *sel = Some(uri);
                 }
             }
         }
         
         loop {
-            // Check for commands (non-blocking)
+            // Process ALL pending commands first (non-blocking)
             while let Ok(cmd) = camera_cmd_rx.try_recv() {
                 match cmd {
                     CameraCommand::Refresh => {
                         println!("Refreshing camera list...");
-                        // Must drop stream before enumerating devices
-                        let had_stream = current_stream.is_some();
                         let old_uri = selected_for_thread.lock().ok().and_then(|s| s.clone());
+                        
+                        // Drop stream FIRST to release device
                         current_stream = None;
                         
+                        // Now safe to enumerate
                         let cameras = list_cameras();
                         if let Ok(mut cams) = cameras_for_thread.lock() {
                             *cams = cameras;
                         }
                         
-                        // Re-open previous camera if it still exists
-                        if had_stream {
-                            if let Some(uri) = old_uri {
-                                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                                    current_stream = Some(s);
-                                }
+                        // Re-open previous camera if it existed
+                        if let Some(uri) = old_uri {
+                            if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                                current_stream = Some(s);
                             }
                         }
                     }
@@ -365,11 +362,9 @@ fn main() -> Result<()> {
                         }
                         
                         println!("Switching to camera: {}", uri);
-                        // Drop old stream first
-                        current_stream = None;
                         
-                        // Small delay to let V4L2 fully release the device
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        // Drop stream FIRST to release device
+                        current_stream = None;
                         
                         // Update selected URI
                         if let Ok(mut sel) = selected_for_thread.lock() {
@@ -393,25 +388,24 @@ fn main() -> Result<()> {
                 }
             }
             
-            // Read frame from current stream
+            // Read ONE frame (blocking, but bounded by frame rate ~33ms at 30fps)
             if let Some(ref mut stream) = current_stream {
                 let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
                 if let Some(Ok(buf)) = buf {
-                    // Send frame data to render thread
                     let _ = frame_tx.send((buf.to_vec(), stream.d));
                 } else {
                     println!("stream ended");
                     current_stream = None;
                 }
             } else {
-                // No stream, sleep a bit to avoid busy loop
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // No stream, sleep to avoid busy loop
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     });
 
     let _ = eframe::run_native(
-        "app",
+        "UVC Camera",
         NativeOptions::default(),
         Box::new(|ctx| {
             let mut app = UVCPlayer {
