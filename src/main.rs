@@ -230,7 +230,6 @@ fn find_stream_for_camera<'a>(uri: &str) -> anyhow::Result<Option<StreamD<'a>>> 
 
     let dev = ctx.open_device(uri)?;
     let dev = Device::new(dev)?;
-    dbg!(&dev.streams());
     let maxxed = dev
         .streams()?
         .into_iter()
@@ -243,7 +242,6 @@ fn find_stream_for_camera<'a>(uri: &str) -> anyhow::Result<Option<StreamD<'a>>> 
         None => return Ok(None),
     };
     let dimensions = [stream_descr.width as usize, stream_descr.height as usize];
-    println!("Selected stream:\n{:?}", stream_descr);
 
     let stream = dev.start_stream(&stream_descr)?;
 
@@ -262,7 +260,6 @@ fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
 
     // Create a list of valid capture devices in the system.
     let dev_descrs = ctx.devices()?;
-    dbg!(&dev_descrs);
 
     if dev_descrs.len() == 0 {
         return Ok(None);
@@ -271,7 +268,6 @@ fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
     let dev = ctx.open_device(&dev_descrs[0].uri)?;
     // let dev = ctx.open_device("v4l:///dev/video")?;
     let dev = Device::new(dev)?;
-    dbg!(&dev.streams());
     let maxxed = dev
         .streams()?
         .into_iter()
@@ -282,7 +278,6 @@ fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
 
     let stream_descr = maxxed;
     let dimensions = [stream_descr.width as usize, stream_descr.height as usize];
-    println!("Selected stream:\n{:?}", stream_descr);
 
     let stream = dev.start_stream(&stream_descr)?;
 
@@ -330,7 +325,6 @@ fn main() -> Result<()> {
             while let Ok(cmd) = camera_cmd_rx.try_recv() {
                 match cmd {
                     CameraCommand::Refresh => {
-                        println!("Refreshing camera list...");
                         let old_uri = selected_for_thread.lock().ok().and_then(|s| s.clone());
                         
                         // Drop stream FIRST to release device
@@ -357,11 +351,8 @@ fn main() -> Result<()> {
                             .map_or(false, |current| current == uri);
                         
                         if already_selected {
-                            println!("Camera {} already selected, skipping", uri);
                             continue;
                         }
-                        
-                        println!("Switching to camera: {}", uri);
                         
                         // Drop stream FIRST to release device
                         current_stream = None;
@@ -375,14 +366,9 @@ fn main() -> Result<()> {
                         match find_stream_for_camera(&uri) {
                             Ok(Some(s)) => {
                                 current_stream = Some(s);
-                                println!("Successfully opened camera");
                             }
-                            Ok(None) => {
-                                println!("No compatible stream found for camera");
-                            }
-                            Err(e) => {
-                                println!("Error opening camera: {:?}", e);
-                            }
+                            Ok(None) => {}
+                            Err(_) => {}
                         }
                     }
                 }
@@ -394,7 +380,6 @@ fn main() -> Result<()> {
                 if let Some(Ok(buf)) = buf {
                     let _ = frame_tx.send((buf.to_vec(), stream.d));
                 } else {
-                    println!("stream ended");
                     current_stream = None;
                 }
             } else {
@@ -438,6 +423,12 @@ fn main() -> Result<()> {
                 loop {
                     // Receive frames from the camera thread
                     if let Ok((buf, dimensions)) = frame_rx.recv() {
+                        // Validate buffer size before creating image
+                        let expected_size = dimensions[0] * dimensions[1] * 3;
+                        if buf.len() != expected_size {
+                            continue;
+                        }
+                        
                         let mut k = waiting.lock().unwrap();
                         *k = false;
                         drop(k);
@@ -700,10 +691,7 @@ impl App for UVCPlayer {
                 if sense.drag_stopped() {
                     self.ratio.calibrating = false;
                     self.sync_to_profile();
-                    let rex = self.dump_profile();
-                    if rex.is_err() {
-                        dbg!(&rex);
-                    }
+                    let _ = self.dump_profile();
                 }
 
                 let all_rects = self.rects.iter();
