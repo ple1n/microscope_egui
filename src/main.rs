@@ -44,7 +44,17 @@ struct UVCPlayer {
     // Camera selection
     available_cameras: Arc<Mutex<Vec<CameraInfo>>>,
     selected_camera_uri: Arc<Mutex<Option<String>>>,
+    selected_stream: Option<(u32, u32, u32)>, // (width, height, fps)
     camera_cmd_tx: mpsc::Sender<CameraCommand>,
+    verbose_camera_ui: bool,
+}
+
+#[derive(Clone, Debug)]
+struct StreamInfo {
+    width: u32,
+    height: u32,
+    fps: u32,
+    pixfmt: String,
 }
 
 #[derive(Clone, Debug)]
@@ -54,12 +64,15 @@ struct CameraInfo {
     // Best RGB stream info
     resolution: Option<(u32, u32)>,
     fps: Option<u32>,
+    // All available streams (for verbose mode)
+    all_streams: Vec<StreamInfo>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CameraCommand {
     Refresh,
     Select(String),
+    SelectWithResolution(String, u32, u32, u32), // uri, width, height, fps
 }
 
 #[derive(Default, Clone, Copy, Serialize, Deserialize)]
@@ -184,10 +197,37 @@ fn list_cameras() -> Vec<CameraInfo> {
     if let Some(ctx) = PlatformContext::all().next() {
         if let Ok(dev_descrs) = ctx.devices() {
             for dev in dev_descrs {
-                // Try to get best RGB stream info
-                let (resolution, fps) = if let Ok(device) = ctx.open_device(&dev.uri) {
+                let mut all_streams = Vec::new();
+                let mut best_resolution = None;
+                let mut best_fps = None;
+                
+                if let Ok(device) = ctx.open_device(&dev.uri) {
                     if let Ok(device) = Device::new(device) {
                         if let Ok(streams) = device.streams() {
+                            // Collect all RGB streams
+                            for s in streams.iter() {
+                                if s.pixfmt == PixelFormat::Rgb(24) && s.width <= 2560 {
+                                    let fps = (1000.0 / s.interval.as_millis() as f32).round() as u32;
+                                    all_streams.push(StreamInfo {
+                                        width: s.width,
+                                        height: s.height,
+                                        fps,
+                                        pixfmt: "RGB24".to_string(),
+                                    });
+                                }
+                            }
+                            
+                            // Sort by resolution (descending), then fps (descending)
+                            all_streams.sort_by(|a, b| {
+                                let res_a = (a.width as u64) * (a.height as u64);
+                                let res_b = (b.width as u64) * (b.height as u64);
+                                res_b.cmp(&res_a).then(b.fps.cmp(&a.fps))
+                            });
+                            
+                            // Deduplicate (same resolution+fps)
+                            all_streams.dedup_by(|a, b| a.width == b.width && a.height == b.height && a.fps == b.fps);
+                            
+                            // Find best stream
                             let best = streams
                                 .into_iter()
                                 .filter(|x| x.pixfmt == PixelFormat::Rgb(24))
@@ -195,25 +235,19 @@ fn list_cameras() -> Vec<CameraInfo> {
                                 .max_by_key(|d| d.width as u128 * d.height as u128 / d.interval.as_millis());
                             if let Some(s) = best {
                                 let fps = (1000.0 / s.interval.as_millis() as f32).round() as u32;
-                                (Some((s.width, s.height)), Some(fps))
-                            } else {
-                                (None, None)
+                                best_resolution = Some((s.width, s.height));
+                                best_fps = Some(fps);
                             }
-                        } else {
-                            (None, None)
                         }
-                    } else {
-                        (None, None)
                     }
-                } else {
-                    (None, None)
-                };
+                }
                 
                 cameras.push(CameraInfo {
                     uri: dev.uri.clone(),
                     product: dev.product.clone(),
-                    resolution,
-                    fps,
+                    resolution: best_resolution,
+                    fps: best_fps,
+                    all_streams,
                 });
             }
         }
@@ -238,6 +272,41 @@ fn find_stream_for_camera<'a>(uri: &str) -> anyhow::Result<Option<StreamD<'a>>> 
         .max_by_key(|d| d.width as u128 * d.height as u128 / d.interval.as_millis());
 
     let stream_descr = match maxxed {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    let dimensions = [stream_descr.width as usize, stream_descr.height as usize];
+
+    let stream = dev.start_stream(&stream_descr)?;
+
+    Ok(Some(StreamD {
+        st: stream,
+        d: dimensions,
+    }))
+}
+
+fn find_stream_for_camera_with_resolution<'a>(uri: &str, width: u32, height: u32, target_fps: u32) -> anyhow::Result<Option<StreamD<'a>>> {
+    let ctx = if let Some(ctx) = PlatformContext::all().next() {
+        ctx
+    } else {
+        return Ok(None);
+    };
+
+    let dev = ctx.open_device(uri)?;
+    let dev = Device::new(dev)?;
+    
+    // Find stream matching the requested resolution and fps
+    let matching = dev
+        .streams()?
+        .into_iter()
+        .filter(|x| x.pixfmt == PixelFormat::Rgb(24))
+        .filter(|x| x.width == width && x.height == height)
+        .min_by_key(|d| {
+            let fps = (1000.0 / d.interval.as_millis() as f32).round() as i32;
+            (fps - target_fps as i32).abs()
+        });
+
+    let stream_descr = match matching {
         Some(s) => s,
         None => return Ok(None),
     };
@@ -371,6 +440,29 @@ fn main() -> Result<()> {
                             Err(_) => {}
                         }
                     }
+                    CameraCommand::SelectWithResolution(uri, width, height, fps) => {
+                        // Drop stream FIRST to release device
+                        current_stream = None;
+                        
+                        // Update selected URI
+                        if let Ok(mut sel) = selected_for_thread.lock() {
+                            *sel = Some(uri.clone());
+                        }
+                        
+                        // Open new stream with specific resolution
+                        match find_stream_for_camera_with_resolution(&uri, width, height, fps) {
+                            Ok(Some(s)) => {
+                                current_stream = Some(s);
+                            }
+                            Ok(None) => {
+                                // Fallback to best stream if specific resolution not found
+                                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                                    current_stream = Some(s);
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
                 }
             }
             
@@ -410,7 +502,9 @@ fn main() -> Result<()> {
                 waiting: Arc::new(Mutex::new(true)),
                 available_cameras,
                 selected_camera_uri,
+                selected_stream: None,
                 camera_cmd_tx,
+                verbose_camera_ui: false,
             };
 
             app.load_profiles()?;
@@ -548,53 +642,146 @@ impl App for UVCPlayer {
             if cameras.is_empty() {
                 ui.label("No cameras found");
             } else {
-                let mut camera_to_select: Option<String> = None;
-                for cam in cameras.iter() {
-                    let is_selected = selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
-                    
-                    // Device name from URI (e.g., video0)
-                    let dev_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
-                    
-                    // Build info string
-                    let info = if let (Some((w, h)), Some(fps)) = (cam.resolution, cam.fps) {
-                        format!("{}x{} {}fps", w, h, fps)
-                    } else {
-                        "no RGB stream".to_string()
-                    };
-                    
-                    let fill = if is_selected {
-                        Color32::from_rgb(60, 80, 60)
-                    } else {
-                        Color32::from_rgb(40, 40, 45)
-                    };
-                    
-                    let frame_resp = egui::Frame::new()
-                        .fill(fill)
-                        .stroke(Stroke::new(1.0, Color32::GRAY))
-                        .corner_radius(4.0)
-                        .inner_margin(6.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.vertical(|ui| {
+                // Verbose mode toggle
+                ui.checkbox(&mut self.verbose_camera_ui, "Show all streams");
+                ui.add_space(5.);
+                
+                let mut camera_cmd: Option<CameraCommand> = None;
+                
+                if self.verbose_camera_ui {
+                    // Verbose mode: show all streams grouped by device
+                    for cam in cameras.iter() {
+                        let is_device_selected = selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
+                        let dev_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
+                        
+                        // Device header
+                        let header_fill = if is_device_selected {
+                            Color32::from_rgb(50, 65, 50)
+                        } else {
+                            Color32::from_rgb(35, 35, 40)
+                        };
+                        
+                        egui::Frame::new()
+                            .fill(header_fill)
+                            .stroke(Stroke::new(1.0, Color32::DARK_GRAY))
+                            .corner_radius(4.0)
+                            .inner_margin(6.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
                                 ui.label(RichText::new(dev_name).strong().color(Color32::WHITE));
                                 ui.label(RichText::new(&cam.product).small().color(Color32::LIGHT_GRAY));
-                                ui.label(RichText::new(&info).small().color(Color32::from_rgb(150, 200, 150)));
                             });
-                        });
-                    
-                    let click_resp = ui.interact(frame_resp.response.rect, egui::Id::new(&cam.uri), Sense::click());
-                    if click_resp.clicked() {
-                        camera_to_select = Some(cam.uri.clone());
+                        
+                        // Stream list for this device
+                        if cam.all_streams.is_empty() {
+                            ui.indent("no_streams", |ui| {
+                                ui.label(RichText::new("  no RGB streams").small().color(Color32::GRAY));
+                            });
+                        } else {
+                            for stream in &cam.all_streams {
+                                let stream_info = format!("  {}x{} {}fps", stream.width, stream.height, stream.fps);
+                                let stream_id = format!("{}_{}x{}_{}", cam.uri, stream.width, stream.height, stream.fps);
+                                
+                                // Check if this stream is selected
+                                let is_stream_selected = is_device_selected && 
+                                    self.selected_stream.map_or(false, |(w, h, f)| 
+                                        w == stream.width && h == stream.height && f == stream.fps
+                                    );
+                                
+                                // Pre-check hover state
+                                let hover_rect = ui.available_rect_before_wrap();
+                                let is_hovered = ui.rect_contains_pointer(hover_rect.with_max_y(hover_rect.min.y + 24.0));
+                                
+                                let stream_fill = if is_stream_selected {
+                                    Color32::from_rgb(60, 90, 60)
+                                } else if is_hovered {
+                                    Color32::from_rgb(55, 55, 65)
+                                } else {
+                                    Color32::from_rgb(45, 45, 50)
+                                };
+                                
+                                let text_color = if is_stream_selected {
+                                    Color32::from_rgb(180, 255, 180)
+                                } else {
+                                    Color32::from_rgb(150, 200, 150)
+                                };
+                                
+                                let frame_resp = egui::Frame::new()
+                                    .fill(stream_fill)
+                                    .corner_radius(2.0)
+                                    .inner_margin(4.0)
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.label(RichText::new(&stream_info).small().color(text_color));
+                                    });
+                                
+                                let click_resp = ui.interact(frame_resp.response.rect, egui::Id::new(&stream_id), Sense::click());
+                                if click_resp.clicked() {
+                                    self.selected_stream = Some((stream.width, stream.height, stream.fps));
+                                    camera_cmd = Some(CameraCommand::SelectWithResolution(
+                                        cam.uri.clone(),
+                                        stream.width,
+                                        stream.height,
+                                        stream.fps,
+                                    ));
+                                }
+                                if click_resp.hovered() {
+                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                }
+                            }
+                        }
+                        ui.add_space(6.0);
                     }
-                    if click_resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                } else {
+                    // Simple mode: show only best stream per device
+                    for cam in cameras.iter() {
+                        let is_selected = selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
+                        
+                        // Device name from URI (e.g., video0)
+                        let dev_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
+                        
+                        // Build info string
+                        let info = if let (Some((w, h)), Some(fps)) = (cam.resolution, cam.fps) {
+                            format!("{}x{} {}fps", w, h, fps)
+                        } else {
+                            "no RGB stream".to_string()
+                        };
+                        
+                        let fill = if is_selected {
+                            Color32::from_rgb(60, 80, 60)
+                        } else {
+                            Color32::from_rgb(40, 40, 45)
+                        };
+                        
+                        let frame_resp = egui::Frame::new()
+                            .fill(fill)
+                            .stroke(Stroke::new(1.0, Color32::GRAY))
+                            .corner_radius(4.0)
+                            .inner_margin(6.0)
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(dev_name).strong().color(Color32::WHITE));
+                                    ui.label(RichText::new(&cam.product).small().color(Color32::LIGHT_GRAY));
+                                    ui.label(RichText::new(&info).small().color(Color32::from_rgb(150, 200, 150)));
+                                });
+                            });
+                        
+                        let click_resp = ui.interact(frame_resp.response.rect, egui::Id::new(&cam.uri), Sense::click());
+                        if click_resp.clicked() {
+                            self.selected_stream = None; // Clear specific stream selection in simple mode
+                            camera_cmd = Some(CameraCommand::Select(cam.uri.clone()));
+                        }
+                        if click_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        
+                        ui.add_space(4.0);
                     }
-                    
-                    ui.add_space(4.0);
                 }
                 
-                if let Some(uri) = camera_to_select {
-                    let _ = self.camera_cmd_tx.send(CameraCommand::Select(uri));
+                if let Some(cmd) = camera_cmd {
+                    let _ = self.camera_cmd_tx.send(cmd);
                 }
             }
 
