@@ -43,7 +43,7 @@ struct UVCPlayer {
     waiting: Arc<TokioMutex<Option<StreamD>>>,
 
     // Camera selection
-    available_cameras: Arc<RwLock<Vec<CameraInfo>>>,
+    available_cameras: Arc<RwLock<Arc<Vec<CameraInfo>>>>,
     selected_camera_uri: Arc<RwLock<Option<String>>>,
     selected_stream: Option<(u32, u32, u32)>, // (width, height, fps)
     camera_cmd_tx: mpsc::UnboundedSender<CameraCommand>,
@@ -368,7 +368,7 @@ fn find_stream() -> anyhow::Result<Option<StreamD>> {
 }
 
 async fn camera_task(
-    cameras: Arc<RwLock<Vec<CameraInfo>>>,
+    cameras: Arc<RwLock<Arc<Vec<CameraInfo>>>>,
     selected_uri: Arc<RwLock<Option<String>>>,
     mut camera_cmd_rx: mpsc::UnboundedReceiver<CameraCommand>,
     waiting: Arc<TokioMutex<Option<StreamD>>>,
@@ -376,7 +376,7 @@ async fn camera_task(
     // Initial camera list (no stream open yet, safe to enumerate)
     let initial_cameras = list_cameras();
     let first_uri = initial_cameras.first().map(|c| c.uri.clone());
-    *cameras.write().await = initial_cameras;
+    *cameras.write().await = Arc::new(initial_cameras);
 
     // Open first camera
     if let Some(uri) = first_uri {
@@ -400,7 +400,7 @@ async fn camera_task(
 
                 // Now safe to enumerate
                 let new_cameras = list_cameras();
-                *cameras.write().await = new_cameras;
+                *cameras.write().await = Arc::new(new_cameras);
 
                 // Re-open previous camera if it existed
                 if let Some(uri) = old_uri {
@@ -466,7 +466,8 @@ async fn async_main() -> Result<()> {
     let (camera_cmd_tx, camera_cmd_rx) = mpsc::unbounded_channel::<CameraCommand>();
 
     // Shared state for camera list
-    let available_cameras: Arc<RwLock<Vec<CameraInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    let available_cameras: Arc<RwLock<Arc<Vec<CameraInfo>>>> =
+        Arc::new(RwLock::new(Arc::new(Vec::new())));
     let selected_camera_uri: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let waiting: Arc<TokioMutex<Option<StreamD>>> = Arc::new(TokioMutex::new(None));
 
@@ -597,12 +598,12 @@ impl App for UVCPlayer {
             }
             ui.add_space(5.);
 
-            // Clone data to avoid holding locks during UI rendering
-            let cameras: Vec<CameraInfo> = self
+            // Clone an Arc to avoid holding locks (and avoid cloning the Vec) during UI rendering
+            let cameras: Arc<Vec<CameraInfo>> = self
                 .available_cameras
                 .try_read()
                 .map(|c| c.clone())
-                .unwrap_or_default();
+                .unwrap_or_else(|_| Arc::new(Vec::new()));
             let selected_uri: Option<String> = self
                 .selected_camera_uri
                 .try_read()
