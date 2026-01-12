@@ -6,9 +6,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{fs, time::Duration};
 
-use futures::future::pending;
 use std::sync::Arc;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 
 use eframe::{App, Frame, NativeOptions};
@@ -42,8 +40,7 @@ struct UVCPlayer {
 
     show_labels: bool,
 
-    waiting: Arc<TokioMutex<bool>>,
-    frame_rx: mpsc::UnboundedReceiver<(Vec<u8>, [usize; 2])>,
+    waiting: Arc<TokioMutex<Option<StreamD>>>,
 
     // Camera selection
     available_cameras: Arc<RwLock<Vec<CameraInfo>>>,
@@ -191,8 +188,8 @@ impl Widget for &mut Calibration {
     }
 }
 
-struct StreamD<'a> {
-    st: eye::hal::platform::Stream<'a>,
+struct StreamD {
+    st: eye::hal::platform::Stream<'static>,
     d: [usize; 2],
 }
 
@@ -264,7 +261,7 @@ fn list_cameras() -> Vec<CameraInfo> {
     cameras
 }
 
-fn find_stream_for_camera<'a>(uri: &str) -> anyhow::Result<Option<StreamD<'a>>> {
+fn find_stream_for_camera(uri: &str) -> anyhow::Result<Option<StreamD>> {
     let ctx = if let Some(ctx) = PlatformContext::all().next() {
         ctx
     } else {
@@ -294,12 +291,12 @@ fn find_stream_for_camera<'a>(uri: &str) -> anyhow::Result<Option<StreamD<'a>>> 
     }))
 }
 
-fn find_stream_for_camera_with_resolution<'a>(
+fn find_stream_for_camera_with_resolution(
     uri: &str,
     width: u32,
     height: u32,
     target_fps: u32,
-) -> anyhow::Result<Option<StreamD<'a>>> {
+) -> anyhow::Result<Option<StreamD>> {
     let ctx = if let Some(ctx) = PlatformContext::all().next() {
         ctx
     } else {
@@ -334,7 +331,7 @@ fn find_stream_for_camera_with_resolution<'a>(
     }))
 }
 
-fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
+fn find_stream() -> anyhow::Result<Option<StreamD>> {
     let ctx = if let Some(ctx) = PlatformContext::all().next() {
         ctx
     } else {
@@ -374,11 +371,8 @@ async fn camera_task(
     cameras: Arc<RwLock<Vec<CameraInfo>>>,
     selected_uri: Arc<RwLock<Option<String>>>,
     mut camera_cmd_rx: mpsc::UnboundedReceiver<CameraCommand>,
-    frame_tx: mpsc::UnboundedSender<(Vec<u8>, [usize; 2])>,
-    waiting: Arc<TokioMutex<bool>>,
+    waiting: Arc<TokioMutex<Option<StreamD>>>,
 ) {
-    let mut current_stream: Option<StreamD> = None;
-
     // Initial camera list (no stream open yet, safe to enumerate)
     let initial_cameras = list_cameras();
     let first_uri = initial_cameras.first().map(|c| c.uri.clone());
@@ -387,108 +381,78 @@ async fn camera_task(
     // Open first camera
     if let Some(uri) = first_uri {
         if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-            current_stream = Some(s);
+            *waiting.lock().await = Some(s);
             *selected_uri.write().await = Some(uri);
         }
     }
 
-    // Clear waiting as soon as any stream is present
-    *waiting.lock().await = current_stream.is_none();
-
     loop {
-        tokio::select! {
-            // Process commands when available
-            Some(cmd) = camera_cmd_rx.recv() => {
-                match cmd {
-                    CameraCommand::Refresh => {
-                        let old_uri = selected_uri.read().await.clone();
+        let Some(cmd) = camera_cmd_rx.recv().await else {
+            break;
+        };
 
-                        // Drop stream FIRST to release device
-                        current_stream = None;
-                        *waiting.lock().await = true;
+        match cmd {
+            CameraCommand::Refresh => {
+                let old_uri = selected_uri.read().await.clone();
 
-                        // Now safe to enumerate
-                        let new_cameras = list_cameras();
-                        *cameras.write().await = new_cameras;
+                // Drop stream FIRST to release device
+                *waiting.lock().await = None;
 
-                        // Re-open previous camera if it existed
-                        if let Some(uri) = old_uri {
-                            if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                                current_stream = Some(s);
-                            }
-                        }
+                // Now safe to enumerate
+                let new_cameras = list_cameras();
+                *cameras.write().await = new_cameras;
 
-                        *waiting.lock().await = current_stream.is_none();
-                    }
-                    CameraCommand::Select(uri) => {
-                        // Check if already selected
-                        let already_selected = selected_uri.read().await
-                            .as_ref()
-                            .map_or(false, |current| current == &uri);
-
-                        if already_selected {
-                            continue;
-                        }
-
-                        // Drop stream FIRST to release device
-                        current_stream = None;
-                        *waiting.lock().await = true;
-
-                        // Update selected URI
-                        *selected_uri.write().await = Some(uri.clone());
-
-                        // Open new stream
-                        match find_stream_for_camera(&uri) {
-                            Ok(Some(s)) => {
-                                current_stream = Some(s);
-                            }
-                            Ok(None) => {}
-                            Err(_) => {}
-                        }
-
-                        *waiting.lock().await = current_stream.is_none();
-                    }
-                    CameraCommand::SelectWithResolution(uri, width, height, fps) => {
-                        // Drop stream FIRST to release device
-                        current_stream = None;
-                        *waiting.lock().await = true;
-
-                        // Update selected URI
-                        *selected_uri.write().await = Some(uri.clone());
-
-                        // Open new stream with specific resolution
-                        match find_stream_for_camera_with_resolution(&uri, width, height, fps) {
-                            Ok(Some(s)) => {
-                                current_stream = Some(s);
-                            }
-                            Ok(None) => {
-                                // Fallback to best stream if specific resolution not found
-                                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                                    current_stream = Some(s);
-                                }
-                            }
-                            Err(_) => {}
-                        }
-
-                        *waiting.lock().await = current_stream.is_none();
+                // Re-open previous camera if it existed
+                if let Some(uri) = old_uri {
+                    if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                        *waiting.lock().await = Some(s);
                     }
                 }
             }
-            // Read frame when available
-            _ = async {
-                if let Some(ref mut stream) = current_stream {
-                    let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
-                    if let Some(Ok(buf)) = buf {
-                        let _ = frame_tx.send((buf.to_vec(), stream.d));
-                    } else {
-                        current_stream = None;
-                        *waiting.lock().await = true;
-                    }
-                } else {
-                    *waiting.lock().await = true;
-                    pending::<()>().await;
+            CameraCommand::Select(uri) => {
+                // Check if already selected
+                let already_selected = selected_uri
+                    .read()
+                    .await
+                    .as_ref()
+                    .map_or(false, |current| current == &uri);
+
+                if already_selected {
+                    continue;
                 }
-            } => {}
+
+                // Drop stream FIRST to release device
+                *waiting.lock().await = None;
+
+                // Update selected URI
+                *selected_uri.write().await = Some(uri.clone());
+
+                // Open new stream
+                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                    *waiting.lock().await = Some(s);
+                }
+            }
+            CameraCommand::SelectWithResolution(uri, width, height, fps) => {
+                // Drop stream FIRST to release device
+                *waiting.lock().await = None;
+
+                // Update selected URI
+                *selected_uri.write().await = Some(uri.clone());
+
+                // Open new stream with specific resolution
+                match find_stream_for_camera_with_resolution(&uri, width, height, fps) {
+                    Ok(Some(s)) => {
+                        *waiting.lock().await = Some(s);
+                    }
+                    Ok(None) => {
+                        // Fallback to best stream if specific resolution not found
+                        if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+                            *waiting.lock().await = Some(s);
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
         }
     }
 }
@@ -499,24 +463,20 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    let (frame_tx, frame_rx) = mpsc::unbounded_channel::<(Vec<u8>, [usize; 2])>();
     let (camera_cmd_tx, camera_cmd_rx) = mpsc::unbounded_channel::<CameraCommand>();
 
     // Shared state for camera list
     let available_cameras: Arc<RwLock<Vec<CameraInfo>>> = Arc::new(RwLock::new(Vec::new()));
     let selected_camera_uri: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-    let waiting: Arc<TokioMutex<bool>> = Arc::new(TokioMutex::new(true));
+    let waiting: Arc<TokioMutex<Option<StreamD>>> = Arc::new(TokioMutex::new(None));
 
     let cameras_for_task = available_cameras.clone();
     let selected_for_task = selected_camera_uri.clone();
-    let frame_tx_for_task = frame_tx.clone();
-
     // Spawn camera task
     tokio::spawn(camera_task(
         cameras_for_task,
         selected_for_task,
         camera_cmd_rx,
-        frame_tx_for_task,
         waiting.clone(),
     ));
 
@@ -539,7 +499,6 @@ async fn async_main() -> Result<()> {
                 new_profile_name: "0.5x".to_owned(),
                 show_labels: true,
                 waiting,
-                frame_rx,
                 available_cameras,
                 selected_camera_uri,
                 selected_stream: None,
@@ -870,26 +829,29 @@ impl App for UVCPlayer {
             ));
         });
         CentralPanel::default().show(ctx, |ui| {
-            // Non-blocking check of waiting state
-            let is_waiting = self.waiting.try_lock().map_or(true, |x| *x);
-
-            // Drain receiver and present only the newest frame
-            let mut last_frame: Option<(Vec<u8>, [usize; 2])> = None;
-            loop {
-                match self.frame_rx.try_recv() {
-                    Ok(frame) => last_frame = Some(frame),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => break,
-                }
-            }
-            if let Some((buf, dimensions)) = last_frame {
-                let expected_size = dimensions[0] * dimensions[1] * 3;
-                if buf.len() == expected_size {
-                    self.texture.set(
-                        ColorImage::from_rgb(dimensions, &buf),
-                        TextureOptions::default(),
-                    );
-                    ctx.request_repaint();
+            // If the lock is contended (camera task swapping streams), assume a stream exists.
+            let mut is_waiting = false;
+            if let Ok(mut guard) = self.waiting.try_lock() {
+                if let Some(ref mut stream) = *guard {
+                    // NOTE: this may block depending on backend; user requested no frame channel.
+                    let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
+                    if let Some(Ok(buf)) = buf {
+                        let dimensions = stream.d;
+                        let expected_size = dimensions[0] * dimensions[1] * 3;
+                        if buf.len() == expected_size {
+                            self.texture.set(
+                                ColorImage::from_rgb(dimensions, buf),
+                                TextureOptions::default(),
+                            );
+                            ctx.request_repaint();
+                        }
+                    } else {
+                        // Stream ended; drop it.
+                        *guard = None;
+                        is_waiting = true;
+                    }
+                } else {
+                    is_waiting = true;
                 }
             }
 
