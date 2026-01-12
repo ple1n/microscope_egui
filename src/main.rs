@@ -2,33 +2,43 @@
 
 use core::f32;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::{fs, time::Duration};
 
-use std::sync::Arc;
-use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use tokio::sync::{RwLock, mpsc, watch};
 
-use eframe::{App, Frame, NativeOptions};
+use eframe::{App, NativeOptions};
 use egui::epaint::PathStroke;
 use egui::load::SizedTexture;
 use egui::{
-    Button, CentralPanel, Color32, ColorImage, DragValue, Grid, Id, Image, Label, LayerId, Margin,
-    Painter, Pos2, Rect, RichText, SelectableLabel, Sense, Slider, Stroke, TextEdit, TextureHandle,
-    TextureOptions, Ui, Widget, Window, emath, epaint, pos2,
+    Button, CentralPanel, Color32, Image, Label, Pos2, Rect, RichText, Sense, Stroke, TextEdit,
+    Ui, Widget, epaint, pos2,
 };
 
 use enum_map::{Enum, EnumMap};
 use eye::colorconvert::Device;
 use eye::hal::format::PixelFormat;
 use eye::hal::traits::{Context as _, Device as _, Stream as _};
-use eye::hal::{Error, ErrorKind, PlatformContext};
+use eye::hal::PlatformContext;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 struct UVCPlayer {
-    texture: TextureHandle,
+    render_state: eframe::egui_wgpu::RenderState,
+    video_texture: eframe::wgpu::Texture,
+    video_texture_view: eframe::wgpu::TextureView,
+    video_texture_id: egui::TextureId,
+    video_size: [u32; 2],
+    frame_rx: watch::Receiver<FrameData>,
+    shutdown_tx: watch::Sender<bool>,
+    last_frame_seq: u64,
+
     rects: Vec<Rect>,
     rect_begin: Option<Pos2>,
 
@@ -39,8 +49,6 @@ struct UVCPlayer {
     new_profile_name: String,
 
     show_labels: bool,
-
-    waiting: Arc<TokioMutex<Option<StreamD>>>,
 
     // Camera selection
     available_cameras: Arc<RwLock<Arc<Vec<CameraInfo>>>>,
@@ -74,6 +82,21 @@ enum CameraCommand {
     Refresh,
     Select(String),
     SelectWithResolution(String, u32, u32, u32), // uri, width, height, fps
+}
+
+#[derive(Clone, Debug)]
+struct StreamSelection {
+    uri: String,
+    resolution: Option<(u32, u32, u32)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FrameData {
+    seq: u64,
+    width: u32,
+    height: u32,
+    bytes_per_row: u32,
+    rgba_padded: Arc<Vec<u8>>,
 }
 
 #[derive(Default, Clone, Copy, Serialize, Deserialize)]
@@ -371,32 +394,38 @@ async fn camera_task(
     cameras: Arc<RwLock<Arc<Vec<CameraInfo>>>>,
     selected_uri: Arc<RwLock<Option<String>>>,
     mut camera_cmd_rx: mpsc::UnboundedReceiver<CameraCommand>,
-    waiting: Arc<TokioMutex<Option<StreamD>>>,
+    stream_sel_tx: watch::Sender<Option<StreamSelection>>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     // Initial camera list (no stream open yet, safe to enumerate)
     let initial_cameras = list_cameras();
     let first_uri = initial_cameras.first().map(|c| c.uri.clone());
     *cameras.write().await = Arc::new(initial_cameras);
 
-    // Open first camera
+    // Select first camera
     if let Some(uri) = first_uri {
-        if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-            *waiting.lock().await = Some(s);
-            *selected_uri.write().await = Some(uri);
-        }
+        *selected_uri.write().await = Some(uri.clone());
+        let _ = stream_sel_tx.send_replace(Some(StreamSelection {
+            uri,
+            resolution: None,
+        }));
     }
 
     loop {
-        let Some(cmd) = camera_cmd_rx.recv().await else {
-            break;
-        };
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            maybe_cmd = camera_cmd_rx.recv() => {
+                let Some(cmd) = maybe_cmd else {
+                    break;
+                };
 
-        match cmd {
-            CameraCommand::Refresh => {
+                match cmd {
+                    CameraCommand::Refresh => {
                 let old_uri = selected_uri.read().await.clone();
-
-                // Drop stream FIRST to release device
-                *waiting.lock().await = None;
 
                 // Now safe to enumerate
                 let new_cameras = list_cameras();
@@ -404,12 +433,13 @@ async fn camera_task(
 
                 // Re-open previous camera if it existed
                 if let Some(uri) = old_uri {
-                    if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                        *waiting.lock().await = Some(s);
-                    }
+                    let _ = stream_sel_tx.send_replace(Some(StreamSelection {
+                        uri,
+                        resolution: None,
+                    }));
                 }
-            }
-            CameraCommand::Select(uri) => {
+                    }
+                    CameraCommand::Select(uri) => {
                 // Check if already selected
                 let already_selected = selected_uri
                     .read()
@@ -421,39 +451,137 @@ async fn camera_task(
                     continue;
                 }
 
-                // Drop stream FIRST to release device
-                *waiting.lock().await = None;
-
                 // Update selected URI
                 *selected_uri.write().await = Some(uri.clone());
 
-                // Open new stream
-                if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                    *waiting.lock().await = Some(s);
-                }
-            }
-            CameraCommand::SelectWithResolution(uri, width, height, fps) => {
-                // Drop stream FIRST to release device
-                *waiting.lock().await = None;
-
+                let _ = stream_sel_tx.send_replace(Some(StreamSelection {
+                    uri,
+                    resolution: None,
+                }));
+                    }
+                    CameraCommand::SelectWithResolution(uri, width, height, fps) => {
                 // Update selected URI
                 *selected_uri.write().await = Some(uri.clone());
 
-                // Open new stream with specific resolution
-                match find_stream_for_camera_with_resolution(&uri, width, height, fps) {
-                    Ok(Some(s)) => {
-                        *waiting.lock().await = Some(s);
+                let _ = stream_sel_tx.send_replace(Some(StreamSelection {
+                    uri,
+                    resolution: Some((width, height, fps)),
+                }));
                     }
-                    Ok(None) => {
-                        // Fallback to best stream if specific resolution not found
-                        if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                            *waiting.lock().await = Some(s);
-                        }
-                    }
-                    Err(_) => {}
                 }
             }
         }
+    }
+}
+
+async fn frame_pump_task(
+    mut stream_sel_rx: watch::Receiver<Option<StreamSelection>>,
+    frame_tx: watch::Sender<FrameData>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    let mut current_stop: Option<Arc<AtomicBool>> = None;
+    let mut current_handle: Option<tokio::task::JoinHandle<()>> = None;
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            changed = stream_sel_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+        }
+
+        if let Some(stop) = current_stop.take() {
+            stop.store(true, Ordering::Relaxed);
+        }
+        if let Some(handle) = current_handle.take() {
+            // Don't block the async runtime forever if the camera read is stuck.
+            let _ = tokio::time::timeout(Duration::from_millis(200), handle).await;
+        }
+
+        let Some(sel) = stream_sel_rx.borrow().clone() else {
+            if frame_tx.send(FrameData::default()).is_err() {
+                break;
+            }
+            continue;
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_task = stop.clone();
+        current_stop = Some(stop);
+
+        let frame_tx = frame_tx.clone();
+        current_handle = Some(tokio::task::spawn_blocking(move || {
+            let open = match sel.resolution {
+                Some((w, h, fps)) => find_stream_for_camera_with_resolution(&sel.uri, w, h, fps)
+                    .ok()
+                    .flatten(),
+                None => find_stream_for_camera(&sel.uri).ok().flatten(),
+            };
+
+            let Some(mut stream) = open else {
+                let _ = frame_tx.send(FrameData::default());
+                return;
+            };
+
+            let width = stream.d[0] as u32;
+            let height = stream.d[1] as u32;
+            let unpadded_bpr = width.saturating_mul(4);
+            let align = eframe::wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded_bpr = ((unpadded_bpr + align - 1) / align) * align;
+
+            let mut seq: u64 = 0;
+            while !stop_for_task.load(Ordering::Relaxed) {
+                let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
+                let Some(Ok(rgb)) = buf else {
+                    break;
+                };
+
+                if rgb.len() != (width as usize * height as usize * 3) {
+                    continue;
+                }
+
+                let mut rgba_padded = vec![0u8; (padded_bpr as usize) * (height as usize)];
+
+                for y in 0..(height as usize) {
+                    let src_row = &rgb[y * (width as usize) * 3..(y + 1) * (width as usize) * 3];
+                    let dst_row = &mut rgba_padded
+                        [y * (padded_bpr as usize)..y * (padded_bpr as usize) + (width as usize) * 4];
+
+                    for (x, pix) in src_row.chunks_exact(3).enumerate() {
+                        let j = x * 4;
+                        dst_row[j] = pix[0];
+                        dst_row[j + 1] = pix[1];
+                        dst_row[j + 2] = pix[2];
+                        dst_row[j + 3] = 255;
+                    }
+                }
+
+                seq = seq.wrapping_add(1);
+                if frame_tx
+                    .send(FrameData {
+                    seq,
+                    width,
+                    height,
+                    bytes_per_row: padded_bpr,
+                    rgba_padded: Arc::new(rgba_padded),
+                })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
+    // Shutdown/close requested: signal the blocking capture loop to stop.
+    if let Some(stop) = current_stop.take() {
+        stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -464,33 +592,77 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let (camera_cmd_tx, camera_cmd_rx) = mpsc::unbounded_channel::<CameraCommand>();
+    let (stream_sel_tx, stream_sel_rx) = watch::channel::<Option<StreamSelection>>(None);
+    let (frame_tx, frame_rx) = watch::channel::<FrameData>(FrameData::default());
+    let (shutdown_tx, shutdown_rx) = watch::channel::<bool>(false);
 
     // Shared state for camera list
     let available_cameras: Arc<RwLock<Arc<Vec<CameraInfo>>>> =
         Arc::new(RwLock::new(Arc::new(Vec::new())));
     let selected_camera_uri: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
-    let waiting: Arc<TokioMutex<Option<StreamD>>> = Arc::new(TokioMutex::new(None));
 
     let cameras_for_task = available_cameras.clone();
     let selected_for_task = selected_camera_uri.clone();
+
+    tokio::spawn(frame_pump_task(stream_sel_rx, frame_tx, shutdown_rx.clone()));
+
     // Spawn camera task
     tokio::spawn(camera_task(
         cameras_for_task,
         selected_for_task,
         camera_cmd_rx,
-        waiting.clone(),
+        stream_sel_tx,
+        shutdown_rx,
     ));
 
     let _ = eframe::run_native(
         "UVC Camera",
         NativeOptions::default(),
         Box::new(move |ctx| {
+            let render_state = ctx
+                .wgpu_render_state
+                .clone()
+                .expect("eframe is not running with the wgpu renderer");
+
+            let device = &render_state.device;
+
+            let initial_w = 256u32;
+            let initial_h = 256u32;
+            let video_texture = device.create_texture(&eframe::wgpu::TextureDescriptor {
+                label: Some("video_texture"),
+                size: eframe::wgpu::Extent3d {
+                    width: initial_w,
+                    height: initial_h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: eframe::wgpu::TextureDimension::D2,
+                format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING
+                    | eframe::wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let video_texture_view = video_texture.create_view(&Default::default());
+
+            let video_texture_id = {
+                let mut renderer = render_state.renderer.write();
+                renderer.register_native_texture(
+                    device,
+                    &video_texture_view,
+                    eframe::wgpu::FilterMode::Linear,
+                )
+            };
+
             let mut app = UVCPlayer {
-                texture: ctx.egui_ctx.load_texture(
-                    "vid",
-                    ColorImage::new([1, 1], Color32::BLACK),
-                    Default::default(),
-                ),
+                render_state,
+                video_texture,
+                video_texture_view,
+                video_texture_id,
+                video_size: [initial_w, initial_h],
+                frame_rx,
+                shutdown_tx: shutdown_tx.clone(),
+                last_frame_seq: 0,
                 rect_begin: None,
                 rect_motion: None,
                 rects: Default::default(),
@@ -499,7 +671,6 @@ async fn async_main() -> Result<()> {
                 active_profile: None,
                 new_profile_name: "0.5x".to_owned(),
                 show_labels: true,
-                waiting,
                 available_cameras,
                 selected_camera_uri,
                 selected_stream: None,
@@ -584,6 +755,10 @@ impl UVCPlayer {
 
 impl App for UVCPlayer {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().close_requested()) {
+            let _ = self.shutdown_tx.send(true);
+        }
+
         egui::SidePanel::new(egui::panel::Side::Right, "rpanel").show(ctx, |ui| {
             ui.add_space(10.);
 
@@ -830,33 +1005,77 @@ impl App for UVCPlayer {
             ));
         });
         CentralPanel::default().show(ctx, |ui| {
-            // If the lock is contended (camera task swapping streams), assume a stream exists.
-            let mut is_waiting = false;
-            if let Ok(mut guard) = self.waiting.try_lock() {
-                if let Some(ref mut stream) = *guard {
-                    // NOTE: this may block depending on backend; user requested no frame channel.
-                    let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
-                    if let Some(Ok(buf)) = buf {
-                        let dimensions = stream.d;
-                        let expected_size = dimensions[0] * dimensions[1] * 3;
-                        if buf.len() == expected_size {
-                            self.texture.set(
-                                ColorImage::from_rgb(dimensions, buf),
-                                TextureOptions::default(),
+            let mut is_waiting = true;
+            {
+                let frame = self.frame_rx.borrow().clone();
+                if frame.seq != 0 && frame.seq != self.last_frame_seq {
+                    self.last_frame_seq = frame.seq;
+                    is_waiting = false;
+
+                    if self.video_size != [frame.width, frame.height] {
+                        let device = &self.render_state.device;
+                        let new_texture = device.create_texture(&eframe::wgpu::TextureDescriptor {
+                            label: Some("video_texture"),
+                            size: eframe::wgpu::Extent3d {
+                                width: frame.width,
+                                height: frame.height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: eframe::wgpu::TextureDimension::D2,
+                            format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
+                            usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING
+                                | eframe::wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let new_view = new_texture.create_view(&Default::default());
+                        {
+                            let mut renderer = self.render_state.renderer.write();
+                            renderer.update_egui_texture_from_wgpu_texture(
+                                device,
+                                &new_view,
+                                eframe::wgpu::FilterMode::Linear,
+                                self.video_texture_id,
                             );
-                            ctx.request_repaint();
                         }
-                    } else {
-                        // Stream ended; drop it.
-                        *guard = None;
-                        is_waiting = true;
+                        self.video_texture = new_texture;
+                        self.video_texture_view = new_view;
+                        self.video_size = [frame.width, frame.height];
                     }
-                } else {
-                    is_waiting = true;
+
+                    let bytes_per_row = frame.bytes_per_row;
+                    let rows_per_image = frame.height;
+
+                    if bytes_per_row != 0 && rows_per_image != 0 {
+                        self.render_state.queue.write_texture(
+                            eframe::wgpu::TexelCopyTextureInfo {
+                                texture: &self.video_texture,
+                                mip_level: 0,
+                                origin: eframe::wgpu::Origin3d::ZERO,
+                                aspect: eframe::wgpu::TextureAspect::All,
+                            },
+                            &frame.rgba_padded,
+                            eframe::wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(bytes_per_row),
+                                rows_per_image: Some(rows_per_image),
+                            },
+                            eframe::wgpu::Extent3d {
+                                width: frame.width,
+                                height: frame.height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        ctx.request_repaint();
+                    }
+                } else if frame.seq != 0 {
+                    // We have a stream, but no new frame since last paint.
+                    is_waiting = false;
                 }
             }
 
-            // Keep the UI ticking while a stream is open
+            // Keep the UI ticking while frames are arriving.
             if !is_waiting {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
@@ -866,7 +1085,10 @@ impl App for UVCPlayer {
                     .response
             } else {
                 let response = ui.add(
-                    Image::new(SizedTexture::from_handle(&self.texture))
+                    Image::new(SizedTexture::new(
+                        self.video_texture_id,
+                        [self.video_size[0] as f32, self.video_size[1] as f32],
+                    ))
                         .maintain_aspect_ratio(true)
                         .shrink_to_fit(),
                 );
