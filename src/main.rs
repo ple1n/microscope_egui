@@ -546,21 +546,28 @@ async fn frame_pump_task(
                     continue;
                 }
 
-                let mut rgba_padded = vec![0u8; (padded_bpr as usize) * (height as usize)];
+                let rgba_padded = if true {
+                    let mut rgba_padded = vec![0u8; (padded_bpr as usize) * (height as usize)];
 
-                for y in 0..(height as usize) {
-                    let src_row = &rgb[y * (width as usize) * 3..(y + 1) * (width as usize) * 3];
-                    let dst_row = &mut rgba_padded
-                        [y * (padded_bpr as usize)..y * (padded_bpr as usize) + (width as usize) * 4];
+                    for y in 0..(height as usize) {
+                        let src_row =
+                            &rgb[y * (width as usize) * 3..(y + 1) * (width as usize) * 3];
+                        let dst_row = &mut rgba_padded[y * (padded_bpr as usize)
+                            ..y * (padded_bpr as usize) + (width as usize) * 4];
 
-                    for (x, pix) in src_row.chunks_exact(3).enumerate() {
-                        let j = x * 4;
-                        dst_row[j] = pix[0];
-                        dst_row[j + 1] = pix[1];
-                        dst_row[j + 2] = pix[2];
-                        dst_row[j + 3] = 255;
+                        for (x, pix) in src_row.chunks_exact(3).enumerate() {
+                            let j = x * 4;
+                            dst_row[j] = pix[0];
+                            dst_row[j + 1] = pix[1];
+                            dst_row[j + 2] = pix[2];
+                            dst_row[j + 3] = 255;
+                        }
                     }
-                }
+
+                    rgba_padded
+                } else {
+                    vec![0u8; (padded_bpr as usize) * (height as usize)]
+                };
 
                 seq = seq.wrapping_add(1);
                 if frame_tx
