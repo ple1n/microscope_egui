@@ -2837,6 +2837,7 @@ dependencies = [
  "enum-map",
  "eye",
  "inotify",
+ "parking_lot",
  "serde",
  "serde_json",
  "tokio",

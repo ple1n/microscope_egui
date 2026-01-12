@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::{fs, time::Duration};
 
+use parking_lot::RwLock as ParkingRwLock;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -16,15 +17,15 @@ use eframe::{App, NativeOptions};
 use egui::epaint::PathStroke;
 use egui::load::SizedTexture;
 use egui::{
-    Button, CentralPanel, Color32, Image, Label, Pos2, Rect, RichText, Sense, Stroke, TextEdit,
-    Ui, Widget, epaint, pos2,
+    Button, CentralPanel, Color32, Image, Label, Pos2, Rect, RichText, Sense, Stroke, TextEdit, Ui,
+    Widget, epaint, pos2,
 };
 
 use enum_map::{Enum, EnumMap};
 use eye::colorconvert::Device;
+use eye::hal::PlatformContext;
 use eye::hal::format::PixelFormat;
 use eye::hal::traits::{Context as _, Device as _, Stream as _};
-use eye::hal::PlatformContext;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,7 @@ struct UVCPlayer {
     video_texture_view: eframe::wgpu::TextureView,
     video_texture_id: egui::TextureId,
     video_size: [u32; 2],
-    frame_rx: watch::Receiver<FrameData>,
+    shared_frame: Arc<ParkingRwLock<SharedFrame>>,
     shutdown_tx: watch::Sender<bool>,
     last_frame_seq: u64,
 
@@ -91,12 +92,12 @@ struct StreamSelection {
 }
 
 #[derive(Clone, Debug, Default)]
-struct FrameData {
+struct SharedFrame {
     seq: u64,
     width: u32,
     height: u32,
     bytes_per_row: u32,
-    rgba_padded: Arc<Vec<u8>>,
+    rgba_padded: Vec<u8>,
 }
 
 #[derive(Default, Clone, Copy, Serialize, Deserialize)]
@@ -476,7 +477,7 @@ async fn camera_task(
 
 async fn frame_pump_task(
     mut stream_sel_rx: watch::Receiver<Option<StreamSelection>>,
-    frame_tx: watch::Sender<FrameData>,
+    shared_frame: Arc<ParkingRwLock<SharedFrame>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut current_stop: Option<Arc<AtomicBool>> = None;
@@ -505,9 +506,8 @@ async fn frame_pump_task(
         }
 
         let Some(sel) = stream_sel_rx.borrow().clone() else {
-            if frame_tx.send(FrameData::default()).is_err() {
-                break;
-            }
+            let mut frame = shared_frame.write();
+            *frame = SharedFrame::default();
             continue;
         };
 
@@ -515,7 +515,7 @@ async fn frame_pump_task(
         let stop_for_task = stop.clone();
         current_stop = Some(stop);
 
-        let frame_tx = frame_tx.clone();
+        let shared_frame = shared_frame.clone();
         current_handle = Some(tokio::task::spawn_blocking(move || {
             let open = match sel.resolution {
                 Some((w, h, fps)) => find_stream_for_camera_with_resolution(&sel.uri, w, h, fps)
@@ -525,7 +525,8 @@ async fn frame_pump_task(
             };
 
             let Some(mut stream) = open else {
-                let _ = frame_tx.send(FrameData::default());
+                let mut frame = shared_frame.write();
+                *frame = SharedFrame::default();
                 return;
             };
 
@@ -534,6 +535,18 @@ async fn frame_pump_task(
             let unpadded_bpr = width.saturating_mul(4);
             let align = eframe::wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
             let padded_bpr = ((unpadded_bpr + align - 1) / align) * align;
+
+            // One shared buffer; the UI reads with try_read, so it won't block.
+            {
+                let mut frame = shared_frame.write();
+                frame.width = width;
+                frame.height = height;
+                frame.bytes_per_row = padded_bpr;
+                let needed_len = (padded_bpr as usize) * (height as usize);
+                if frame.rgba_padded.len() != needed_len {
+                    frame.rgba_padded.resize(needed_len, 0);
+                }
+            }
 
             let mut seq: u64 = 0;
             while !stop_for_task.load(Ordering::Relaxed) {
@@ -546,41 +559,32 @@ async fn frame_pump_task(
                     continue;
                 }
 
-                let rgba_padded = if true {
-                    let mut rgba_padded = vec![0u8; (padded_bpr as usize) * (height as usize)];
+                {
+                    // Try to keep UI responsive: if UI is reading, skip this frame.
+                    let mut frame = shared_frame.write();
 
-                    for y in 0..(height as usize) {
-                        let src_row =
-                            &rgb[y * (width as usize) * 3..(y + 1) * (width as usize) * 3];
-                        let dst_row = &mut rgba_padded[y * (padded_bpr as usize)
-                            ..y * (padded_bpr as usize) + (width as usize) * 4];
+                    // CPU profiling toggle: set to `false` to upload blank frames.
+                    if true {
+                        for y in 0..(height as usize) {
+                            let src_row =
+                                &rgb[y * (width as usize) * 3..(y + 1) * (width as usize) * 3];
+                            let dst_row = &mut frame.rgba_padded[y * (padded_bpr as usize)
+                                ..y * (padded_bpr as usize) + (width as usize) * 4];
 
-                        for (x, pix) in src_row.chunks_exact(3).enumerate() {
-                            let j = x * 4;
-                            dst_row[j] = pix[0];
-                            dst_row[j + 1] = pix[1];
-                            dst_row[j + 2] = pix[2];
-                            dst_row[j + 3] = 255;
+                            for (x, pix) in src_row.chunks_exact(3).enumerate() {
+                                let j = x * 4;
+                                dst_row[j] = pix[0];
+                                dst_row[j + 1] = pix[1];
+                                dst_row[j + 2] = pix[2];
+                                dst_row[j + 3] = 255;
+                            }
                         }
+                    } else {
+                        frame.rgba_padded.fill(0);
                     }
 
-                    rgba_padded
-                } else {
-                    vec![0u8; (padded_bpr as usize) * (height as usize)]
-                };
-
-                seq = seq.wrapping_add(1);
-                if frame_tx
-                    .send(FrameData {
-                    seq,
-                    width,
-                    height,
-                    bytes_per_row: padded_bpr,
-                    rgba_padded: Arc::new(rgba_padded),
-                })
-                    .is_err()
-                {
-                    break;
+                    seq = seq.wrapping_add(1);
+                    frame.seq = seq;
                 }
             }
         }));
@@ -600,8 +604,10 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     let (camera_cmd_tx, camera_cmd_rx) = mpsc::unbounded_channel::<CameraCommand>();
     let (stream_sel_tx, stream_sel_rx) = watch::channel::<Option<StreamSelection>>(None);
-    let (frame_tx, frame_rx) = watch::channel::<FrameData>(FrameData::default());
     let (shutdown_tx, shutdown_rx) = watch::channel::<bool>(false);
+
+    let shared_frame: Arc<ParkingRwLock<SharedFrame>> =
+        Arc::new(ParkingRwLock::new(SharedFrame::default()));
 
     // Shared state for camera list
     let available_cameras: Arc<RwLock<Arc<Vec<CameraInfo>>>> =
@@ -611,7 +617,11 @@ async fn async_main() -> Result<()> {
     let cameras_for_task = available_cameras.clone();
     let selected_for_task = selected_camera_uri.clone();
 
-    tokio::spawn(frame_pump_task(stream_sel_rx, frame_tx, shutdown_rx.clone()));
+    tokio::spawn(frame_pump_task(
+        stream_sel_rx,
+        shared_frame.clone(),
+        shutdown_rx.clone(),
+    ));
 
     // Spawn camera task
     tokio::spawn(camera_task(
@@ -667,7 +677,7 @@ async fn async_main() -> Result<()> {
                 video_texture_view,
                 video_texture_id,
                 video_size: [initial_w, initial_h],
-                frame_rx,
+                shared_frame: shared_frame.clone(),
                 shutdown_tx: shutdown_tx.clone(),
                 last_frame_seq: 0,
                 rect_begin: None,
@@ -1012,92 +1022,95 @@ impl App for UVCPlayer {
             ));
         });
         CentralPanel::default().show(ctx, |ui| {
-            let mut is_waiting = true;
+            let has_selection = self
+                .selected_camera_uri
+                .try_read()
+                .ok()
+                .and_then(|s| s.clone())
+                .is_some();
+
             {
-                let frame = self.frame_rx.borrow().clone();
-                if frame.seq != 0 && frame.seq != self.last_frame_seq {
-                    self.last_frame_seq = frame.seq;
-                    is_waiting = false;
-
-                    if self.video_size != [frame.width, frame.height] {
-                        let device = &self.render_state.device;
-                        let new_texture = device.create_texture(&eframe::wgpu::TextureDescriptor {
-                            label: Some("video_texture"),
-                            size: eframe::wgpu::Extent3d {
-                                width: frame.width,
-                                height: frame.height,
-                                depth_or_array_layers: 1,
-                            },
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: eframe::wgpu::TextureDimension::D2,
-                            format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
-                            usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING
-                                | eframe::wgpu::TextureUsages::COPY_DST,
-                            view_formats: &[],
-                        });
-                        let new_view = new_texture.create_view(&Default::default());
-                        {
-                            let mut renderer = self.render_state.renderer.write();
-                            renderer.update_egui_texture_from_wgpu_texture(
-                                device,
-                                &new_view,
-                                eframe::wgpu::FilterMode::Linear,
-                                self.video_texture_id,
-                            );
+                let frame = self.shared_frame.try_read();
+                if let Some(frame) = frame {
+                    if frame.seq != 0 && frame.seq != self.last_frame_seq {
+                        self.last_frame_seq = frame.seq;
+                        
+                        if self.video_size != [frame.width, frame.height] {
+                            let device = &self.render_state.device;
+                            let new_texture =
+                                device.create_texture(&eframe::wgpu::TextureDescriptor {
+                                    label: Some("video_texture"),
+                                    size: eframe::wgpu::Extent3d {
+                                        width: frame.width,
+                                        height: frame.height,
+                                        depth_or_array_layers: 1,
+                                    },
+                                    mip_level_count: 1,
+                                    sample_count: 1,
+                                    dimension: eframe::wgpu::TextureDimension::D2,
+                                    format: eframe::wgpu::TextureFormat::Rgba8UnormSrgb,
+                                    usage: eframe::wgpu::TextureUsages::TEXTURE_BINDING
+                                        | eframe::wgpu::TextureUsages::COPY_DST,
+                                    view_formats: &[],
+                                });
+                            let new_view = new_texture.create_view(&Default::default());
+                            {
+                                let mut renderer = self.render_state.renderer.write();
+                                renderer.update_egui_texture_from_wgpu_texture(
+                                    device,
+                                    &new_view,
+                                    eframe::wgpu::FilterMode::Linear,
+                                    self.video_texture_id,
+                                );
+                            }
+                            self.video_texture = new_texture;
+                            self.video_texture_view = new_view;
+                            self.video_size = [frame.width, frame.height];
                         }
-                        self.video_texture = new_texture;
-                        self.video_texture_view = new_view;
-                        self.video_size = [frame.width, frame.height];
-                    }
 
-                    let bytes_per_row = frame.bytes_per_row;
-                    let rows_per_image = frame.height;
+                        let bytes_per_row = frame.bytes_per_row;
+                        let rows_per_image = frame.height;
 
-                    if bytes_per_row != 0 && rows_per_image != 0 {
-                        self.render_state.queue.write_texture(
-                            eframe::wgpu::TexelCopyTextureInfo {
-                                texture: &self.video_texture,
-                                mip_level: 0,
-                                origin: eframe::wgpu::Origin3d::ZERO,
-                                aspect: eframe::wgpu::TextureAspect::All,
-                            },
-                            &frame.rgba_padded,
-                            eframe::wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(bytes_per_row),
-                                rows_per_image: Some(rows_per_image),
-                            },
-                            eframe::wgpu::Extent3d {
-                                width: frame.width,
-                                height: frame.height,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                        ctx.request_repaint();
+                        if bytes_per_row != 0 && rows_per_image != 0 {
+                            self.render_state.queue.write_texture(
+                                eframe::wgpu::TexelCopyTextureInfo {
+                                    texture: &self.video_texture,
+                                    mip_level: 0,
+                                    origin: eframe::wgpu::Origin3d::ZERO,
+                                    aspect: eframe::wgpu::TextureAspect::All,
+                                },
+                                &frame.rgba_padded,
+                                eframe::wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(bytes_per_row),
+                                    rows_per_image: Some(rows_per_image),
+                                },
+                                eframe::wgpu::Extent3d {
+                                    width: frame.width,
+                                    height: frame.height,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            ctx.request_repaint();
+                        }
                     }
-                } else if frame.seq != 0 {
-                    // We have a stream, but no new frame since last paint.
-                    is_waiting = false;
                 }
             }
 
-            // Keep the UI ticking while frames are arriving.
-            if !is_waiting {
+            if has_selection {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
 
-            if is_waiting {
-                ui.centered_and_justified(|ui| ui.label("waiting for device"))
-                    .response
+            if !has_selection {
+                ui.centered_and_justified(|ui| ui.label("select a camera"));
             } else {
                 let response = ui.add(
                     Image::new(SizedTexture::new(
                         self.video_texture_id,
                         [self.video_size[0] as f32, self.video_size[1] as f32],
                     ))
-                        .maintain_aspect_ratio(true)
-                        .shrink_to_fit(),
+                    .maintain_aspect_ratio(true)
+                    .shrink_to_fit(),
                 );
 
                 let pt = ui.painter();
@@ -1220,7 +1233,6 @@ impl App for UVCPlayer {
                         PathStroke::new(3., Color32::WHITE),
                     ));
                 }
-                response
             }
         });
     }
