@@ -4,8 +4,12 @@ use core::f32;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, mpsc};
-use std::{fs, thread};
+use std::{fs, time::Duration};
+
+use futures::future::pending;
+use std::sync::Arc;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::{Mutex as TokioMutex, RwLock, mpsc};
 
 use eframe::{App, Frame, NativeOptions};
 use egui::epaint::PathStroke;
@@ -23,7 +27,6 @@ use eye::hal::traits::{Context as _, Device as _, Stream as _};
 use eye::hal::{Error, ErrorKind, PlatformContext};
 
 use anyhow::{Result, bail};
-use inotify::{Inotify, WatchMask};
 use serde::{Deserialize, Serialize};
 
 struct UVCPlayer {
@@ -39,13 +42,14 @@ struct UVCPlayer {
 
     show_labels: bool,
 
-    waiting: Arc<Mutex<bool>>,
+    waiting: Arc<TokioMutex<bool>>,
+    frame_rx: mpsc::UnboundedReceiver<(Vec<u8>, [usize; 2])>,
 
     // Camera selection
-    available_cameras: Arc<Mutex<Vec<CameraInfo>>>,
-    selected_camera_uri: Arc<Mutex<Option<String>>>,
+    available_cameras: Arc<RwLock<Vec<CameraInfo>>>,
+    selected_camera_uri: Arc<RwLock<Option<String>>>,
     selected_stream: Option<(u32, u32, u32)>, // (width, height, fps)
-    camera_cmd_tx: mpsc::Sender<CameraCommand>,
+    camera_cmd_tx: mpsc::UnboundedSender<CameraCommand>,
     verbose_camera_ui: bool,
 }
 
@@ -200,14 +204,15 @@ fn list_cameras() -> Vec<CameraInfo> {
                 let mut all_streams = Vec::new();
                 let mut best_resolution = None;
                 let mut best_fps = None;
-                
+
                 if let Ok(device) = ctx.open_device(&dev.uri) {
                     if let Ok(device) = Device::new(device) {
                         if let Ok(streams) = device.streams() {
                             // Collect all RGB streams
                             for s in streams.iter() {
                                 if s.pixfmt == PixelFormat::Rgb(24) && s.width <= 2560 {
-                                    let fps = (1000.0 / s.interval.as_millis() as f32).round() as u32;
+                                    let fps =
+                                        (1000.0 / s.interval.as_millis() as f32).round() as u32;
                                     all_streams.push(StreamInfo {
                                         width: s.width,
                                         height: s.height,
@@ -216,23 +221,27 @@ fn list_cameras() -> Vec<CameraInfo> {
                                     });
                                 }
                             }
-                            
+
                             // Sort by resolution (descending), then fps (descending)
                             all_streams.sort_by(|a, b| {
                                 let res_a = (a.width as u64) * (a.height as u64);
                                 let res_b = (b.width as u64) * (b.height as u64);
                                 res_b.cmp(&res_a).then(b.fps.cmp(&a.fps))
                             });
-                            
+
                             // Deduplicate (same resolution+fps)
-                            all_streams.dedup_by(|a, b| a.width == b.width && a.height == b.height && a.fps == b.fps);
-                            
+                            all_streams.dedup_by(|a, b| {
+                                a.width == b.width && a.height == b.height && a.fps == b.fps
+                            });
+
                             // Find best stream
                             let best = streams
                                 .into_iter()
                                 .filter(|x| x.pixfmt == PixelFormat::Rgb(24))
                                 .filter(|x| x.width <= 2560)
-                                .max_by_key(|d| d.width as u128 * d.height as u128 / d.interval.as_millis());
+                                .max_by_key(|d| {
+                                    d.width as u128 * d.height as u128 / d.interval.as_millis()
+                                });
                             if let Some(s) = best {
                                 let fps = (1000.0 / s.interval.as_millis() as f32).round() as u32;
                                 best_resolution = Some((s.width, s.height));
@@ -241,7 +250,7 @@ fn list_cameras() -> Vec<CameraInfo> {
                         }
                     }
                 }
-                
+
                 cameras.push(CameraInfo {
                     uri: dev.uri.clone(),
                     product: dev.product.clone(),
@@ -285,7 +294,12 @@ fn find_stream_for_camera<'a>(uri: &str) -> anyhow::Result<Option<StreamD<'a>>> 
     }))
 }
 
-fn find_stream_for_camera_with_resolution<'a>(uri: &str, width: u32, height: u32, target_fps: u32) -> anyhow::Result<Option<StreamD<'a>>> {
+fn find_stream_for_camera_with_resolution<'a>(
+    uri: &str,
+    width: u32,
+    height: u32,
+    target_fps: u32,
+) -> anyhow::Result<Option<StreamD<'a>>> {
     let ctx = if let Some(ctx) = PlatformContext::all().next() {
         ctx
     } else {
@@ -294,7 +308,7 @@ fn find_stream_for_camera_with_resolution<'a>(uri: &str, width: u32, height: u32
 
     let dev = ctx.open_device(uri)?;
     let dev = Device::new(dev)?;
-    
+
     // Find stream matching the requested resolution and fps
     let matching = dev
         .streams()?
@@ -356,81 +370,73 @@ fn find_stream<'a>() -> anyhow::Result<Option<StreamD<'a>>> {
     }))
 }
 
-fn main() -> Result<()> {
-    let (frame_tx, frame_rx) = mpsc::channel::<(Vec<u8>, [usize; 2])>();
-    let (camera_cmd_tx, camera_cmd_rx) = mpsc::channel::<CameraCommand>();
-    
-    // Shared state for camera list
-    let available_cameras: Arc<Mutex<Vec<CameraInfo>>> = Arc::new(Mutex::new(Vec::new()));
-    let selected_camera_uri: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    
-    let cameras_for_thread = available_cameras.clone();
-    let selected_for_thread = selected_camera_uri.clone();
+async fn camera_task(
+    cameras: Arc<RwLock<Vec<CameraInfo>>>,
+    selected_uri: Arc<RwLock<Option<String>>>,
+    mut camera_cmd_rx: mpsc::UnboundedReceiver<CameraCommand>,
+    frame_tx: mpsc::UnboundedSender<(Vec<u8>, [usize; 2])>,
+    waiting: Arc<TokioMutex<bool>>,
+) {
+    let mut current_stream: Option<StreamD> = None;
 
-    // Single camera thread - owns the stream directly
-    // Blocking on frame read is OK: at 30fps, commands process every ~33ms
-    thread::spawn(move || {
-        let mut current_stream: Option<StreamD> = None;
-        
-        // Initial camera list (no stream open yet, safe to enumerate)
-        let initial_cameras = list_cameras();
-        let first_uri = initial_cameras.first().map(|c| c.uri.clone());
-        if let Ok(mut cams) = cameras_for_thread.lock() {
-            *cams = initial_cameras;
+    // Initial camera list (no stream open yet, safe to enumerate)
+    let initial_cameras = list_cameras();
+    let first_uri = initial_cameras.first().map(|c| c.uri.clone());
+    *cameras.write().await = initial_cameras;
+
+    // Open first camera
+    if let Some(uri) = first_uri {
+        if let Ok(Some(s)) = find_stream_for_camera(&uri) {
+            current_stream = Some(s);
+            *selected_uri.write().await = Some(uri);
         }
-        
-        // Open first camera
-        if let Some(uri) = first_uri {
-            if let Ok(Some(s)) = find_stream_for_camera(&uri) {
-                current_stream = Some(s);
-                if let Ok(mut sel) = selected_for_thread.lock() {
-                    *sel = Some(uri);
-                }
-            }
-        }
-        
-        loop {
-            // Process ALL pending commands first (non-blocking)
-            while let Ok(cmd) = camera_cmd_rx.try_recv() {
+    }
+
+    // Clear waiting as soon as any stream is present
+    *waiting.lock().await = current_stream.is_none();
+
+    loop {
+        tokio::select! {
+            // Process commands when available
+            Some(cmd) = camera_cmd_rx.recv() => {
                 match cmd {
                     CameraCommand::Refresh => {
-                        let old_uri = selected_for_thread.lock().ok().and_then(|s| s.clone());
-                        
+                        let old_uri = selected_uri.read().await.clone();
+
                         // Drop stream FIRST to release device
                         current_stream = None;
-                        
+                        *waiting.lock().await = true;
+
                         // Now safe to enumerate
-                        let cameras = list_cameras();
-                        if let Ok(mut cams) = cameras_for_thread.lock() {
-                            *cams = cameras;
-                        }
-                        
+                        let new_cameras = list_cameras();
+                        *cameras.write().await = new_cameras;
+
                         // Re-open previous camera if it existed
                         if let Some(uri) = old_uri {
                             if let Ok(Some(s)) = find_stream_for_camera(&uri) {
                                 current_stream = Some(s);
                             }
                         }
+
+                        *waiting.lock().await = current_stream.is_none();
                     }
                     CameraCommand::Select(uri) => {
                         // Check if already selected
-                        let already_selected = selected_for_thread.lock()
-                            .ok()
-                            .and_then(|s| s.clone())
-                            .map_or(false, |current| current == uri);
-                        
+                        let already_selected = selected_uri.read().await
+                            .as_ref()
+                            .map_or(false, |current| current == &uri);
+
                         if already_selected {
                             continue;
                         }
-                        
+
                         // Drop stream FIRST to release device
                         current_stream = None;
-                        
+                        *waiting.lock().await = true;
+
                         // Update selected URI
-                        if let Ok(mut sel) = selected_for_thread.lock() {
-                            *sel = Some(uri.clone());
-                        }
-                        
+                        *selected_uri.write().await = Some(uri.clone());
+
                         // Open new stream
                         match find_stream_for_camera(&uri) {
                             Ok(Some(s)) => {
@@ -439,16 +445,17 @@ fn main() -> Result<()> {
                             Ok(None) => {}
                             Err(_) => {}
                         }
+
+                        *waiting.lock().await = current_stream.is_none();
                     }
                     CameraCommand::SelectWithResolution(uri, width, height, fps) => {
                         // Drop stream FIRST to release device
                         current_stream = None;
-                        
+                        *waiting.lock().await = true;
+
                         // Update selected URI
-                        if let Ok(mut sel) = selected_for_thread.lock() {
-                            *sel = Some(uri.clone());
-                        }
-                        
+                        *selected_uri.write().await = Some(uri.clone());
+
                         // Open new stream with specific resolution
                         match find_stream_for_camera_with_resolution(&uri, width, height, fps) {
                             Ok(Some(s)) => {
@@ -462,29 +469,61 @@ fn main() -> Result<()> {
                             }
                             Err(_) => {}
                         }
+
+                        *waiting.lock().await = current_stream.is_none();
                     }
                 }
             }
-            
-            // Read ONE frame (blocking, but bounded by frame rate ~33ms at 30fps)
-            if let Some(ref mut stream) = current_stream {
-                let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
-                if let Some(Ok(buf)) = buf {
-                    let _ = frame_tx.send((buf.to_vec(), stream.d));
+            // Read frame when available
+            _ = async {
+                if let Some(ref mut stream) = current_stream {
+                    let buf: Option<std::result::Result<&[u8], _>> = stream.st.next();
+                    if let Some(Ok(buf)) = buf {
+                        let _ = frame_tx.send((buf.to_vec(), stream.d));
+                    } else {
+                        current_stream = None;
+                        *waiting.lock().await = true;
+                    }
                 } else {
-                    current_stream = None;
+                    *waiting.lock().await = true;
+                    pending::<()>().await;
                 }
-            } else {
-                // No stream, sleep to avoid busy loop
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            } => {}
         }
-    });
+    }
+}
+
+fn main() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async { async_main().await })
+}
+
+async fn async_main() -> Result<()> {
+    let (frame_tx, frame_rx) = mpsc::unbounded_channel::<(Vec<u8>, [usize; 2])>();
+    let (camera_cmd_tx, camera_cmd_rx) = mpsc::unbounded_channel::<CameraCommand>();
+
+    // Shared state for camera list
+    let available_cameras: Arc<RwLock<Vec<CameraInfo>>> = Arc::new(RwLock::new(Vec::new()));
+    let selected_camera_uri: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+    let waiting: Arc<TokioMutex<bool>> = Arc::new(TokioMutex::new(true));
+
+    let cameras_for_task = available_cameras.clone();
+    let selected_for_task = selected_camera_uri.clone();
+    let frame_tx_for_task = frame_tx.clone();
+
+    // Spawn camera task
+    tokio::spawn(camera_task(
+        cameras_for_task,
+        selected_for_task,
+        camera_cmd_rx,
+        frame_tx_for_task,
+        waiting.clone(),
+    ));
 
     let _ = eframe::run_native(
         "UVC Camera",
         NativeOptions::default(),
-        Box::new(|ctx| {
+        Box::new(move |ctx| {
             let mut app = UVCPlayer {
                 texture: ctx.egui_ctx.load_texture(
                     "vid",
@@ -499,7 +538,8 @@ fn main() -> Result<()> {
                 active_profile: None,
                 new_profile_name: "0.5x".to_owned(),
                 show_labels: true,
-                waiting: Arc::new(Mutex::new(true)),
+                waiting,
+                frame_rx,
                 available_cameras,
                 selected_camera_uri,
                 selected_stream: None,
@@ -508,39 +548,6 @@ fn main() -> Result<()> {
             };
 
             app.load_profiles()?;
-
-            let mut txt = app.texture.clone();
-            let ctx = ctx.egui_ctx.clone();
-            let waiting = app.waiting.clone();
-
-            thread::spawn(move || {
-                loop {
-                    // Receive frames from the camera thread
-                    if let Ok((buf, dimensions)) = frame_rx.recv() {
-                        // Validate buffer size before creating image
-                        let expected_size = dimensions[0] * dimensions[1] * 3;
-                        if buf.len() != expected_size {
-                            continue;
-                        }
-                        
-                        let mut k = waiting.lock().unwrap();
-                        *k = false;
-                        drop(k);
-                        
-                        txt.set(
-                            ColorImage::from_rgb(dimensions, &buf),
-                            TextureOptions::default(),
-                        );
-                        ctx.request_repaint();
-                    } else {
-                        // Channel closed or error
-                        let mut k = waiting.lock().unwrap();
-                        *k = true;
-                        drop(k);
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                    }
-                }
-            });
 
             Result::Ok(Box::new(app))
         }),
@@ -632,10 +639,14 @@ impl App for UVCPlayer {
             ui.add_space(5.);
 
             // Clone data to avoid holding locks during UI rendering
-            let cameras: Vec<CameraInfo> = self.available_cameras.lock()
+            let cameras: Vec<CameraInfo> = self
+                .available_cameras
+                .try_read()
                 .map(|c| c.clone())
                 .unwrap_or_default();
-            let selected_uri: Option<String> = self.selected_camera_uri.lock()
+            let selected_uri: Option<String> = self
+                .selected_camera_uri
+                .try_read()
                 .ok()
                 .and_then(|s| s.clone());
 
@@ -645,22 +656,23 @@ impl App for UVCPlayer {
                 // Verbose mode toggle
                 ui.checkbox(&mut self.verbose_camera_ui, "Show all streams");
                 ui.add_space(5.);
-                
+
                 let mut camera_cmd: Option<CameraCommand> = None;
-                
+
                 if self.verbose_camera_ui {
                     // Verbose mode: show all streams grouped by device
                     for cam in cameras.iter() {
-                        let is_device_selected = selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
+                        let is_device_selected =
+                            selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
                         let dev_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
-                        
+
                         // Device header
                         let header_fill = if is_device_selected {
                             Color32::from_rgb(50, 65, 50)
                         } else {
                             Color32::from_rgb(35, 35, 40)
                         };
-                        
+
                         egui::Frame::new()
                             .fill(header_fill)
                             .stroke(Stroke::new(1.0, Color32::DARK_GRAY))
@@ -669,29 +681,45 @@ impl App for UVCPlayer {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.label(RichText::new(dev_name).strong().color(Color32::WHITE));
-                                ui.label(RichText::new(&cam.product).small().color(Color32::LIGHT_GRAY));
+                                ui.label(
+                                    RichText::new(&cam.product)
+                                        .small()
+                                        .color(Color32::LIGHT_GRAY),
+                                );
                             });
-                        
+
                         // Stream list for this device
                         if cam.all_streams.is_empty() {
                             ui.indent("no_streams", |ui| {
-                                ui.label(RichText::new("  no RGB streams").small().color(Color32::GRAY));
+                                ui.label(
+                                    RichText::new("  no RGB streams")
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
                             });
                         } else {
                             for stream in &cam.all_streams {
-                                let stream_info = format!("  {}x{} {}fps", stream.width, stream.height, stream.fps);
-                                let stream_id = format!("{}_{}x{}_{}", cam.uri, stream.width, stream.height, stream.fps);
-                                
+                                let stream_info = format!(
+                                    "  {}x{} {}fps",
+                                    stream.width, stream.height, stream.fps
+                                );
+                                let stream_id = format!(
+                                    "{}_{}x{}_{}",
+                                    cam.uri, stream.width, stream.height, stream.fps
+                                );
+
                                 // Check if this stream is selected
-                                let is_stream_selected = is_device_selected && 
-                                    self.selected_stream.map_or(false, |(w, h, f)| 
+                                let is_stream_selected = is_device_selected
+                                    && self.selected_stream.map_or(false, |(w, h, f)| {
                                         w == stream.width && h == stream.height && f == stream.fps
-                                    );
-                                
+                                    });
+
                                 // Pre-check hover state
                                 let hover_rect = ui.available_rect_before_wrap();
-                                let is_hovered = ui.rect_contains_pointer(hover_rect.with_max_y(hover_rect.min.y + 24.0));
-                                
+                                let is_hovered = ui.rect_contains_pointer(
+                                    hover_rect.with_max_y(hover_rect.min.y + 24.0),
+                                );
+
                                 let stream_fill = if is_stream_selected {
                                     Color32::from_rgb(60, 90, 60)
                                 } else if is_hovered {
@@ -699,25 +727,32 @@ impl App for UVCPlayer {
                                 } else {
                                     Color32::from_rgb(45, 45, 50)
                                 };
-                                
+
                                 let text_color = if is_stream_selected {
                                     Color32::from_rgb(180, 255, 180)
                                 } else {
                                     Color32::from_rgb(150, 200, 150)
                                 };
-                                
+
                                 let frame_resp = egui::Frame::new()
                                     .fill(stream_fill)
                                     .corner_radius(2.0)
                                     .inner_margin(4.0)
                                     .show(ui, |ui| {
                                         ui.set_width(ui.available_width());
-                                        ui.label(RichText::new(&stream_info).small().color(text_color));
+                                        ui.label(
+                                            RichText::new(&stream_info).small().color(text_color),
+                                        );
                                     });
-                                
-                                let click_resp = ui.interact(frame_resp.response.rect, egui::Id::new(&stream_id), Sense::click());
+
+                                let click_resp = ui.interact(
+                                    frame_resp.response.rect,
+                                    egui::Id::new(&stream_id),
+                                    Sense::click(),
+                                );
                                 if click_resp.clicked() {
-                                    self.selected_stream = Some((stream.width, stream.height, stream.fps));
+                                    self.selected_stream =
+                                        Some((stream.width, stream.height, stream.fps));
                                     camera_cmd = Some(CameraCommand::SelectWithResolution(
                                         cam.uri.clone(),
                                         stream.width,
@@ -736,23 +771,23 @@ impl App for UVCPlayer {
                     // Simple mode: show only best stream per device
                     for cam in cameras.iter() {
                         let is_selected = selected_uri.as_ref().map_or(false, |u| u == &cam.uri);
-                        
+
                         // Device name from URI (e.g., video0)
                         let dev_name = cam.uri.split('/').last().unwrap_or(&cam.uri);
-                        
+
                         // Build info string
                         let info = if let (Some((w, h)), Some(fps)) = (cam.resolution, cam.fps) {
                             format!("{}x{} {}fps", w, h, fps)
                         } else {
                             "no RGB stream".to_string()
                         };
-                        
+
                         let fill = if is_selected {
                             Color32::from_rgb(60, 80, 60)
                         } else {
                             Color32::from_rgb(40, 40, 45)
                         };
-                        
+
                         let frame_resp = egui::Frame::new()
                             .fill(fill)
                             .stroke(Stroke::new(1.0, Color32::GRAY))
@@ -761,13 +796,27 @@ impl App for UVCPlayer {
                             .show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.vertical(|ui| {
-                                    ui.label(RichText::new(dev_name).strong().color(Color32::WHITE));
-                                    ui.label(RichText::new(&cam.product).small().color(Color32::LIGHT_GRAY));
-                                    ui.label(RichText::new(&info).small().color(Color32::from_rgb(150, 200, 150)));
+                                    ui.label(
+                                        RichText::new(dev_name).strong().color(Color32::WHITE),
+                                    );
+                                    ui.label(
+                                        RichText::new(&cam.product)
+                                            .small()
+                                            .color(Color32::LIGHT_GRAY),
+                                    );
+                                    ui.label(
+                                        RichText::new(&info)
+                                            .small()
+                                            .color(Color32::from_rgb(150, 200, 150)),
+                                    );
                                 });
                             });
-                        
-                        let click_resp = ui.interact(frame_resp.response.rect, egui::Id::new(&cam.uri), Sense::click());
+
+                        let click_resp = ui.interact(
+                            frame_resp.response.rect,
+                            egui::Id::new(&cam.uri),
+                            Sense::click(),
+                        );
                         if click_resp.clicked() {
                             self.selected_stream = None; // Clear specific stream selection in simple mode
                             camera_cmd = Some(CameraCommand::Select(cam.uri.clone()));
@@ -775,11 +824,11 @@ impl App for UVCPlayer {
                         if click_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        
+
                         ui.add_space(4.0);
                     }
                 }
-                
+
                 if let Some(cmd) = camera_cmd {
                     let _ = self.camera_cmd_tx.send(cmd);
                 }
@@ -821,7 +870,35 @@ impl App for UVCPlayer {
             ));
         });
         CentralPanel::default().show(ctx, |ui| {
-            if self.waiting.try_lock().map_or(true, |x| *x) {
+            // Non-blocking check of waiting state
+            let is_waiting = self.waiting.try_lock().map_or(true, |x| *x);
+
+            // Drain receiver and present only the newest frame
+            let mut last_frame: Option<(Vec<u8>, [usize; 2])> = None;
+            loop {
+                match self.frame_rx.try_recv() {
+                    Ok(frame) => last_frame = Some(frame),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+            if let Some((buf, dimensions)) = last_frame {
+                let expected_size = dimensions[0] * dimensions[1] * 3;
+                if buf.len() == expected_size {
+                    self.texture.set(
+                        ColorImage::from_rgb(dimensions, &buf),
+                        TextureOptions::default(),
+                    );
+                    ctx.request_repaint();
+                }
+            }
+
+            // Keep the UI ticking while a stream is open
+            if !is_waiting {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+
+            if is_waiting {
                 ui.centered_and_justified(|ui| ui.label("waiting for device"))
                     .response
             } else {
