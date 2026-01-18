@@ -28,7 +28,10 @@ use eye::hal::format::PixelFormat;
 use eye::hal::traits::{Context as _, Device as _, Stream as _};
 
 use anyhow::Result;
+use anyhow::bail;
+use image::RgbaImage;
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct UVCPlayer {
     render_state: eframe::egui_wgpu::RenderState,
@@ -57,6 +60,10 @@ struct UVCPlayer {
     selected_stream: Option<(u32, u32, u32)>, // (width, height, fps)
     camera_cmd_tx: mpsc::UnboundedSender<CameraCommand>,
     verbose_camera_ui: bool,
+
+    // Capture UI/state
+    save_path: String,
+    last_capture_status: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -160,7 +167,7 @@ impl Widget for &mut Calibration {
         ui.vertical(|ui| {
             ui.add_space(20.);
             ui.add(Label::new(
-                RichText::new("calibration").color(Color32::WHITE.gamma_multiply(0.9)),
+                RichText::new("Calibration").color(Color32::WHITE.gamma_multiply(0.9)),
             ));
             ui.add_space(10.);
 
@@ -693,6 +700,8 @@ async fn async_main() -> Result<()> {
                 selected_stream: None,
                 camera_cmd_tx,
                 verbose_camera_ui: false,
+                save_path: "./captures".to_owned(),
+                last_capture_status: None,
             };
 
             app.load_profiles()?;
@@ -770,8 +779,49 @@ impl UVCPlayer {
     }
 }
 
+impl UVCPlayer {
+    pub fn capture_to_path(&self, target: &std::path::Path) -> Result<std::path::PathBuf> {
+        let frame = self.shared_frame.read();
+        if frame.seq == 0 {
+            bail!("no frame available to capture");
+        }
+
+        let width = frame.width as u32;
+        let height = frame.height as u32;
+        let bpr = frame.bytes_per_row as usize;
+        let row_bytes = (width as usize) * 4;
+
+        if frame.rgba_padded.len() < bpr * (height as usize) {
+            bail!("frame buffer too small");
+        }
+
+        let mut img: RgbaImage = RgbaImage::new(width, height);
+        for y in 0..height {
+            let start = (y as usize) * bpr;
+            let src = &frame.rgba_padded[start..start + row_bytes];
+            for x in 0..width as usize {
+                let si = x * 4;
+                let px = image::Rgba([src[si], src[si + 1], src[si + 2], src[si + 3]]);
+                img.put_pixel(x as u32, y, px);
+            }
+        }
+
+        // Target is always a directory; error if it exists and is a file
+        if target.exists() && !target.is_dir() {
+            bail!("target path exists but is not a directory: {:?}", target);
+        }
+        std::fs::create_dir_all(target)?;
+        
+        let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+        let out_path = target.join(format!("capture-{}.png", millis));
+
+        img.save_with_format(&out_path, image::ImageFormat::Png)?;
+        Ok(out_path)
+    }
+}
+
 impl App for UVCPlayer {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if ctx.input(|i| i.viewport().close_requested()) {
             let _ = self.shutdown_tx.send(true);
         }
@@ -990,12 +1040,39 @@ impl App for UVCPlayer {
             ui.separator();
             ui.add_space(10.);
 
+            // Capture controls
+            ui.add(Label::new(
+                RichText::new("Capture").color(Color32::WHITE.gamma_multiply(0.9)),
+            ));
+            ui.add_space(6.);
+            ui.horizontal(|ui| {
+                let text = TextEdit::singleline(&mut self.save_path).desired_width(220.);
+                ui.add(text);
+                if ui.button("Capture Frame").clicked() {
+                    let path = std::path::Path::new(&self.save_path);
+                    match self.capture_to_path(path) {
+                        Ok(p) => self.last_capture_status = Some(format!("Saved {}", p.display())),
+                        Err(e) => {
+                            eprintln!("capture error: {:?}", e);
+                            self.last_capture_status = Some(format!("Error: {}", e));
+                        }
+                    }
+                }
+            });
+            if let Some(msg) = &self.last_capture_status {
+                ui.label(msg);
+            }
+
+            ui.add_space(15.);
+            ui.separator();
+            ui.add_space(10.);
+
             ui.add(Label::new(
                 RichText::new("Profiles").color(Color32::WHITE.gamma_multiply(0.9)),
             ));
             ui.add_space(5.);
 
-            for (pb, data) in &self.profiles {
+            for (pb, _) in &self.profiles {
                 let lb = ui.selectable_label(
                     self.active_profile.as_ref().map_or(false, |v| v == pb),
                     pb.file_stem().unwrap().to_str().unwrap(),
@@ -1034,7 +1111,7 @@ impl App for UVCPlayer {
                 if let Some(frame) = frame {
                     if frame.seq != 0 && frame.seq != self.last_frame_seq {
                         self.last_frame_seq = frame.seq;
-                        
+
                         if self.video_size != [frame.width, frame.height] {
                             let device = &self.render_state.device;
                             let new_texture =
@@ -1137,11 +1214,9 @@ impl App for UVCPlayer {
                         self.rect_motion = Some(p);
                     }
                 }
-                let mut appeneded = Vec::new();
                 if let Some(bg) = self.rect_begin {
                     if let Some(mv) = self.rect_motion {
                         let moving_rect = Rect::from_points(&[bg, mv]);
-                        appeneded = vec![moving_rect];
 
                         if self.ratio.calibrating {
                             let len = moving_rect.width();
@@ -1184,7 +1259,7 @@ impl App for UVCPlayer {
                 }
 
                 let dist_label = |px: f32| {
-                    if let Some(a) = self.ratio.active {
+                    if self.ratio.active.is_some() {
                         let n = self.ratio.from_px(px as f64);
                         format!("{:.2}µm", n)
                     } else {
